@@ -27,17 +27,28 @@ officiel ; il suffit de relancer l'installation pour retrouver GLOUTON.
 Les commandes de GLOUTON
 -------------------------
 
-Flèches haut / bas ..... avancer / reculer (maintiens haut : TURBO)
-Flèches gauche / droite  tourner
-OK ..................... entrer dans le portail ou la borne que tu regardes
-EXE .................... sauter
-Retour ................. le téléporteur (lieux, applis, jeux)
-Boîte à outils ......... la carte des zones déjà explorées
-1 2 3 4 5 .............. changer de réalité (Synthwave, Liminal, Matrix,
-                         Abysse, Cahier)
-6 ...................... la réalité ARC-EN-CIEL (à débloquer)
-Ans .................... BIP raconte une blague
-π ...................... la fête du π
-Var .................... mode photo (cache l'interface)
+Flèches gauche / droite  se déplacer
+Haut ou EXE ............ sauter (maintiens pour sauter plus haut)
+Bas .................... s'écraser (en l'air : plongeon)
+OK ..................... la langue : manger le bonbon (l'appli) ou le
+                         biscuit (le résultat) visé
+Retour ................. le frigo : toutes les applis et tous les jeux
+Boîte à outils ......... son carnet de santé (1 : LED, 2 : écran vivant)
+1 2 3 4 5 .............. changer de décor (Jardin, Nuit, Volcan, Espace,
+                         Aquarium)
+6 ...................... le décor DISCO (secret : fais-le grandir)
+Var .................... mode photo (cache les jauges)
 
-10 pièces π sont cachées dans le monde. Ne touche pas le Glitch.
+Les touches magiques
+--------------------
+
+x² gonfler (5 fois : il explose)     √ dégonfler
+×  se cloner                          ÷ fusionner les clones
+sin danser                            cos changer de costume
+tan bronzer                           i devenir imaginaire
+-  gravité négative                   ln dormir
+effacer : le chatouiller              + un en-cas
+Ans une blague                        π la fête du π
+
+Fais des calculs dans l'appli Calculs : en revenant, Glouton mange tes
+résultats. Essaie 6×7, 0/0, 1+1, 6×111...
