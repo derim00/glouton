@@ -1,0 +1,5832 @@
+diff --git a/epsilon/Makefile b/epsilon/Makefile
+index 1d61e14f13..923207081d 100644
+--- a/epsilon/Makefile
++++ b/epsilon/Makefile
+@@ -2,7 +2,7 @@
+ 
+ PATH_haussmann := ../haussmann
+ APP_NAME := Epsilon
+-APP_VERSION := 26.1.0
++APP_VERSION := 26.4.0
+ OUTPUT_ROOT := output
+ DEBUG ?= 0
+ PLATFORM ?= host
+diff --git a/epsilon/apps/apps_container.cpp b/epsilon/apps/apps_container.cpp
+index c2fe7f4016..c1188f169e 100644
+--- a/epsilon/apps/apps_container.cpp
++++ b/epsilon/apps/apps_container.cpp
+@@ -235,15 +235,27 @@ void AppsContainer::switchToBuiltinApp(App::Snapshot* snapshot) {
+   if (activeApp() && snapshot != activeApp()->snapshot()) {
+     resetShiftAlphaStatus();
+   }
+-  if (snapshot == hardwareTestAppSnapshot() ||
++  bool hideTitleBar = snapshot == hardwareTestAppSnapshot() ||
+ #ifdef HARDWARE_CHECKUP
+-      snapshot == hardwareCheckupAppSnapshot() ||
++                      snapshot == hardwareCheckupAppSnapshot() ||
+ #endif
+-      snapshot == onBoardingAppSnapshot()) {
+-    m_window.hideTitleBarView(true);
+-  } else {
+-    m_window.hideTitleBarView(false);
+-  }
++                      snapshot == onBoardingAppSnapshot() ||
++                      snapshot == homeAppSnapshot();
++  if (hideTitleBar != m_window.titleBarViewIsHidden() && activeApp() &&
++      snapshot != activeApp()->snapshot()) {
++    /* GLOUTON (from Windows-OS) fix for the Home / On-Off crash: showing or hiding the title
++     * bar relayouts the views of the app that is still active. When Home was
++     * pressed, the kernel jumped to the Home checkpoint and that app's views
++     * may hold layouts whose pool objects were rolled back: relayouting them
++     * dereferences dangling handles (a HardFault on the calculator, which then
++     * reboots on the official software). Leave the old app first. */
++    Container::switchToBuiltinApp(nullptr);
++  }
++  if (!activeApp()) {
++    // The window must not relayout the views of an app that is gone.
++    m_window.setContentView(nullptr);
++  }
++  m_window.hideTitleBarView(hideTitleBar);
+   if (snapshot) {
+     m_window.setTitle(snapshot->descriptor()->upperName());
+     GlobalContextAccessor::Store().prepareForNewApp();
+@@ -313,6 +325,16 @@ void AppsContainer::run() {
+   Ion::Events::setSpinner(true);
+   Ion::Display::setScreenshotCallback(ShowCursor);
+ 
++  /* GLOUTON (from PSP-OS): this userland is started by the official one (slot A) through
++   * DFU. The kernel may still hold the checkpoints that the official userland
++   * set, and setCheckpoint ignores a checkpoint that is already set: Home (or
++   * waking up from On/Off) would then jump back into slot A's userland. Drop
++   * them so that our own Home checkpoint is the one the kernel uses. */
++  Ion::CircuitBreaker::unsetCheckpoint(
++      Ion::CircuitBreaker::CheckpointType::AnyKey);
++  Ion::CircuitBreaker::unsetCheckpoint(Ion::CircuitBreaker::CheckpointType::Back);
++  Ion::CircuitBreaker::unsetCheckpoint(Ion::CircuitBreaker::CheckpointType::Home);
++
+   /* Setup the home checkpoint so that the exception checkpoint will be
+    * reactivated on a home interrupt. This way, the main exception checkpoint
+    * will keep the home checkpoint as parent. */
+diff --git a/epsilon/apps/apps_window.h b/epsilon/apps/apps_window.h
+index a2b65e8c68..0ff5192f9e 100644
+--- a/epsilon/apps/apps_window.h
++++ b/epsilon/apps/apps_window.h
+@@ -16,6 +16,7 @@ class AppsWindow : public Escher::Window {
+   void reloadTitleBarView();
+   bool updateAlphaLock();
+   void hideTitleBarView(bool hide);
++  bool titleBarViewIsHidden() const { return m_hideTitleBarView; }
+   void updateBatteryAnimation();
+ 
+  private:
+diff --git a/epsilon/apps/calculation/edit_expression_controller.cpp b/epsilon/apps/calculation/edit_expression_controller.cpp
+index 7887238c00..93c9ddf89b 100644
+--- a/epsilon/apps/calculation/edit_expression_controller.cpp
++++ b/epsilon/apps/calculation/edit_expression_controller.cpp
+@@ -1,5 +1,7 @@
+ #include "edit_expression_controller.h"
+ 
++#include <apps/home/glouton/food.h>
++
+ #include <apps/global_preferences.h>
+ #include <apps/shared/global_store.h>
+ #include <assert.h>
+@@ -162,6 +164,22 @@ bool EditExpressionController::layoutFieldDidFinishEditing(
+   Calculation* calculation = m_calculationStore->push(layout).pointer();
+   if (calculation) {
+     HistoryViewCell::ComputeCalculationHeights(calculation);
++    {
++      /* GLOUTON: every result is food for the creature of the home screen.
++       * Only short texts are kept; a failure here only means no food. */
++      char input[Home::Glouton::Food::k_textSize];
++      char output[Home::Glouton::Food::k_textSize];
++      input[0] = output[0] = 0;
++      ExceptionCheckpoint ecp;
++      if (ExceptionRun(ecp)) {
++        calculation->input().serialize(std::span<char>(input, sizeof(input)),
++                                       true);
++        calculation->approximateOutput().serialize(
++            std::span<char>(output, sizeof(output)), true,
++            Preferences::PrintFloatMode::Decimal, 7);
++        Home::Glouton::Food::push(input, output);
++      }
++    }
+     m_historyController->reload(false);
+     layoutField->clearAndSetEditing(true);
+     return true;
+diff --git a/epsilon/apps/home/Makefile b/epsilon/apps/home/Makefile
+index 938c4f9025..2b2d0f4fdc 100644
+--- a/epsilon/apps/home/Makefile
++++ b/epsilon/apps/home/Makefile
+@@ -2,8 +2,14 @@ SOURCES_apps += $(addprefix $(PATH_apps)/home/,$(addsuffix :-test, \
+   app.cpp \
+   app_cell.cpp \
+   controller.cpp \
++  glouton/blob.cpp \
++  glouton/gfx.cpp \
++  glouton/shell.cpp \
+ ))
+ 
++# GLOUTON: the results of the Calculation app are its food
++SOURCES_apps += $(PATH_apps)/home/glouton/food.cpp
++
+ SOURCES_apps += $(call generated_sources_for,$(addprefix $(PATH_apps)/home/, \
+   apps_layout.cpp:-test \
+ ))
+diff --git a/epsilon/apps/home/app.h b/epsilon/apps/home/app.h
+index 97ab41c37b..06ef1bb31f 100644
+--- a/epsilon/apps/home/app.h
++++ b/epsilon/apps/home/app.h
+@@ -3,6 +3,7 @@
+ #include <escher/app.h>
+ #include <escher/container.h>
+ #include <escher/selectable_table_view_data_source.h>
++#include <escher/timer.h>
+ 
+ #include "controller.h"
+ 
+@@ -28,6 +29,9 @@ class App : public Escher::App {
+   const Snapshot* snapshot() const {
+     return static_cast<const Snapshot*>(Escher::App::snapshot());
+   }
++  // GLOUTON: the creature is animated by the run loop (see escher RunLoop)
++  int animationPeriod() override { return m_controller.framePeriod(); }
++  bool animationFrame() override { return m_controller.frame(); }
+ 
+  private:
+   App(Snapshot* snapshot);
+diff --git a/epsilon/apps/home/controller.cpp b/epsilon/apps/home/controller.cpp
+index 3b79f585f4..adfd279387 100644
+--- a/epsilon/apps/home/controller.cpp
++++ b/epsilon/apps/home/controller.cpp
+@@ -3,10 +3,11 @@
+ #include <apps/apps_container.h>
+ #include <apps/exam_mode_manager.h>
+ #include <apps/home/apps_layout.h>
+-#include <ion/keyboard/layout_events.h>
+-#include <poincare/preferences.h>
++#include <apps/i18n.h>
++#include <ion/timing.h>
+ 
+ #include "app.h"
++#include "glouton/shell.h"
+ 
+ extern "C" {
+ #include <assert.h>
+@@ -17,189 +18,95 @@ using namespace Poincare;
+ 
+ namespace Home {
+ 
+-Controller::ContentView::ContentView(
+-    Controller* controller, SelectableTableViewDataSource* selectionDataSource)
+-    : m_selectableTableView(controller, controller, selectionDataSource,
+-                            controller) {
+-  m_selectableTableView.setVerticalCellOverlap(0);
+-  m_selectableTableView.setMargins(k_margins);
+-  m_selectableTableView.setBackgroundColor(ThemeComponent::DefaultBackground);
+-  m_selectableTableView.decorator()->setVerticalMargins(
+-      {k_indicatorMargin, k_indicatorMargin - k_bottomMargin});
+-}
+-
+-SelectableTableView* Controller::ContentView::selectableTableView() {
+-  return &m_selectableTableView;
+-}
++/* ------------------------------------------------------------------ view */
+ 
+-void Controller::ContentView::reloadBottomRow(
+-    SimpleTableViewDataSource* dataSource, int lastIconColumn) {
+-  /* We mark the missing icons on the last row as dirty. */
+-  for (int i = lastIconColumn + 1; i < dataSource->numberOfColumns(); i++) {
+-    markRectAsDirty(KDRect(dataSource->columnWidth(0) * i,
+-                           dataSource->rowHeight(0), dataSource->columnWidth(0),
+-                           dataSource->rowHeight(0)));
++void Controller::ContentView::drawRect(KDContext* ctx, KDRect rect) const {
++  Glouton::Band band;
++  for (KDCoordinate y = rect.top(); y <= rect.bottom();
++       y += Glouton::Band::k_maxHeight) {
++    KDCoordinate h = rect.bottom() - y + 1;
++    if (h > Glouton::Band::k_maxHeight) {
++      h = Glouton::Band::k_maxHeight;
++    }
++    // Always whole rows: the scene is drawn row by row
++    Glouton::Rect area = {0, y, Glouton::k_screenWidth, h};
++    band.begin(area);
++    Glouton::Shell::render(band);
++    ctx->fillRectWithPixels(KDRect(area.x, area.y, area.w, area.h),
++                            band.pixels(), nullptr);
+   }
+ }
+ 
+-View* Controller::ContentView::subviewAtIndex(int index) {
+-  assert(index == 0);
+-  return &m_selectableTableView;
+-}
+-
+-void Controller::ContentView::layoutSubviews(bool force) {
+-  /* Selectable table view's bottom margin is used for vertical scroll: we
+-   * scroll to the selected cell's farthest pixel + bottom margin. For home app,
+-   * instead of having a bottom margin, we reduce the frame of the selectable
+-   * table view and ContentView::drawRect will take care of drawing the white
+-   * pixels at the bottom of the screen. */
+-  KDRect frame =
+-      KDRect(KDPointZero, bounds().width(), bounds().height() - k_bottomMargin);
+-  setChildFrame(&m_selectableTableView, frame, force);
+-}
++/* ------------------------------------------------------------ controller */
+ 
+ Controller::Controller(Responder* parentResponder,
+                        SelectableTableViewDataSource* selectionDataSource)
+-    : ViewController(parentResponder), m_view(this, selectionDataSource) {}
++    : ViewController(parentResponder), m_active(false) {}
+ 
+-bool Controller::handleEvent(Ion::Events::Event event) {
+-  if (event == Ion::Events::OK || event == Ion::Events::EXE) {
+-    switchToSelectedApp();
+-    return true;
++Controller::~Controller() {
++  if (m_active) {
++    Glouton::Shell::detach();
+   }
+-  if (event == Ion::Events::Home || event == Ion::Events::Back) {
+-    m_view.selectableTableView()->selectCellAtLocation(0, 0);
+-    return true;
+-  }
+-  if (event == Ion::Events::Right &&
+-      selectionDataSource()->selectedRow() < numberOfRows() - 1) {
+-    m_view.selectableTableView()->selectCellAtLocation(
+-        0, selectionDataSource()->selectedRow() + 1);
+-    return true;
+-  }
+-  if (event == Ion::Events::Left && selectionDataSource()->selectedRow() > 0) {
+-    m_view.selectableTableView()->selectCellAtLocation(
+-        k_numberOfColumns - 1, selectionDataSource()->selectedRow() - 1);
+-    return true;
++}
++
++bool Controller::handleEvent(Ion::Events::Event event) {
++  bool handled = Glouton::Shell::handleEvent(event);
++  if (handled) {
++    m_view.invalidateAll();
+   }
+-  // Handle keys from 0 to 9
+-  const char* eventTextPtr = event.text();
+-  if (eventTextPtr != nullptr && eventTextPtr[0] != 0 && eventTextPtr[1] == 0 &&
+-      eventTextPtr[0] >= '0' && eventTextPtr[0] <= '9') {
+-    int iconIndex;
+-    if (eventTextPtr[0] == '0') {
+-      // Settings app is the last visible builtin app
+-      iconIndex = numberOfIcons() - 1 -
+-                  AppsContainer::sharedAppsContainer()->numberOfExternalApps();
+-    } else {
+-      iconIndex = eventTextPtr[0] - '1';
+-    }
+-    if (iconIndex >= AppsContainer::sharedAppsContainer()->numberOfApps()) {
+-      return false;
+-    }
+-    int col = columnOfIconAtIndex(iconIndex);
+-    int row = rowOfIconAtIndex(iconIndex);
+-    if (col == m_view.selectableTableView()->selectedColumn() &&
+-        row == m_view.selectableTableView()->selectedRow()) {
+-      // We were already on the selected app
+-      switchToSelectedApp();
+-      return true;
+-    }
+-    m_view.selectableTableView()->selectCellAtLocation(col, row);
+-    return true;
++  // Opening an app destroys this controller: it must be the last thing done
++  launch();
++  return handled;
++}
++
++bool Controller::frame() {
++  if (!m_active) {
++    return false;
+   }
+-  // Handle Down when less than 3 icons at last row
+-  if (event == Ion::Events::Down &&
+-      selectionDataSource()->selectedRow() == numberOfRows() - 2) {
+-    // Otherwise would have been handled by SelectableTableView
+-    assert(selectionDataSource()->selectedColumn() > columnOfLastIcon());
+-    m_view.selectableTableView()->selectCellAtLocation(columnOfLastIcon(),
+-                                                       numberOfRows() - 1);
++  if (Glouton::Shell::frame()) {
++    m_view.invalidateAll();
+     return true;
+   }
+   return false;
+ }
+ 
+-void Controller::handleResponderChainEvent(ResponderChainEvent event) {
+-  if (event.type == ResponderChainEventType::HasBecomeFirst) {
+-    if (selectionDataSource()->selectedRow() == -1) {
+-      selectionDataSource()->selectCellAtLocation(0, 0);
+-    }
+-    App::app()->setFirstResponder(m_view.selectableTableView());
+-  } else {
+-    ViewController::handleResponderChainEvent(event);
+-  }
++int Controller::framePeriod() {
++  return m_active ? Glouton::Shell::framePeriod() : 0;
+ }
+ 
+-HighlightCell* Controller::reusableCell(int index) {
+-  assert(0 <= index && index < reusableCellCount());
+-  return &m_reusableCells[index];
+-}
+-
+-void Controller::fillCellForLocation(HighlightCell* cell, int column, int row) {
+-  AppCell* appCell = static_cast<AppCell*>(cell);
++void Controller::launch() {
++  Glouton::Item item = Glouton::Shell::takeLaunch();
++  if (item.isNone()) {
++    return;
++  }
+   AppsContainer* container = AppsContainer::sharedAppsContainer();
+-  int appIdx = indexOfAppAtColumnAndRow(column, row);
+-  if (appIdx >= container->numberOfApps()) {
+-    appCell->setVisible(false);
+-  } else {
+-    appCell->setVisible(true);
+-    if (appIdx < container->numberOfBuiltinApps()) {
+-      const ::App::Descriptor* descriptor =
+-          container->appSnapshotAtIndex(PermutedAppSnapshotIndex(appIdx))
+-              ->descriptor();
+-      appCell->setBuiltinAppDescriptor(descriptor);
+-    } else {
+-      Ion::ExternalApps::App a = container->externalAppAtIndex(
+-          appIdx - container->numberOfBuiltinApps());
+-      appCell->setExternalApp(a);
++  if (item.kind == Glouton::Item::Kind::External) {
++    if (ExamModeManager::ExamMode().ruleset() != ExamMode::Ruleset::Off) {
++      return;
+     }
++    m_active = false;
++    Glouton::Shell::detach();
++    container->switchToExternalApp(container->externalAppAtIndex(item.index));
++    return;
+   }
+-}
+-
+-int Controller::numberOfIcons() const {
+-  AppsContainer* container = AppsContainer::sharedAppsContainer();
+-  assert(container->numberOfApps() > 0);
+-  return container->numberOfApps() - 1;
+-}
+-
+-void Controller::tableViewDidChangeSelectionAndDidScroll(
+-    SelectableTableView* t, int previousSelectedCol, int previousSelectedRow,
+-    KDPoint previousOffset, bool withinTemporarySelection) {
+-  assert(t == m_view.selectableTableView());
+-  /* If the number of icons is != 3*n, when we display the lowest row, no icons
+-   * are redrawn on the last cells, so the cells are not cleaned. We need to
+-   * redraw a white rect on these cells to hide the leftover icons. Ideally, we
+-   * would have redrawn all the background in white and then redraw visible
+-   * cells. However, the redrawing takes time and is visible at scrolling. Here,
+-   * we avoid the background complete redrawing but the code is a bit clumsy. */
+-  if (!withinTemporarySelection && t->selectedRow() == numberOfRows() - 1) {
+-    m_view.reloadBottomRow(this, columnOfLastIcon());
++  ::App::Snapshot* snapshot =
++      container->appSnapshotAtIndex(PermutedAppSnapshotIndex(item.index));
++  if (appIsForbidden(snapshot->descriptor()->name())) {
++    App::app()->displayWarning(forbiddenAppMessage());
++    return;
+   }
++  m_active = false;
++  Glouton::Shell::detach();
++  container->switchToBuiltinApp(snapshot);
+ }
+ 
+-SelectableTableViewDataSource* Controller::selectionDataSource() const {
+-  return App::app()->snapshot();
+-}
+-
+-void Controller::switchToSelectedApp() {
+-  AppsContainer* container = AppsContainer::sharedAppsContainer();
+-  int appIdx = indexOfAppAtColumnAndRow(selectionDataSource()->selectedColumn(),
+-                                        selectionDataSource()->selectedRow());
+-  if (appIdx < container->numberOfBuiltinApps()) {
+-    ::App::Snapshot* selectedSnapshot =
+-        container->appSnapshotAtIndex(PermutedAppSnapshotIndex(appIdx));
+-    if (appIsForbidden(selectedSnapshot->descriptor()->name())) {
+-      App::app()->displayWarning(forbiddenAppMessage());
+-    } else {
+-      container->switchToBuiltinApp(selectedSnapshot);
+-    }
++void Controller::handleResponderChainEvent(ResponderChainEvent event) {
++  if (event.type == ResponderChainEventType::HasBecomeFirst) {
++    m_active = true;
++    Glouton::Shell::attach();
++    m_view.invalidateAll();
+   } else {
+-    assert(ExamModeManager::ExamMode().ruleset() == ExamMode::Ruleset::Off);
+-    m_view.reload();
+-    Ion::ExternalApps::App a = container->externalAppAtIndex(
+-        appIdx - container->numberOfBuiltinApps());
+-    container->switchToExternalApp(a);
++    ViewController::handleResponderChainEvent(event);
+   }
+ }
+ 
+diff --git a/epsilon/apps/home/controller.h b/epsilon/apps/home/controller.h
+index 7e1e98eb57..004c2b701a 100644
+--- a/epsilon/apps/home/controller.h
++++ b/epsilon/apps/home/controller.h
+@@ -1,102 +1,46 @@
+ #pragma once
+ 
+-#include <escher/regular_table_view_data_source.h>
+-#include <escher/selectable_table_view.h>
++#include <apps/i18n.h>
+ #include <escher/selectable_table_view_data_source.h>
+-#include <escher/selectable_table_view_delegate.h>
+-#include <escher/theme/color_picker.h>
+ #include <escher/view_controller.h>
++#include <ion/external_apps.h>
+ 
+-#include "app_cell.h"
++#include "glouton/gfx.h"
+ 
+ namespace Home {
+ 
+-class Controller : public Escher::ViewController,
+-                   public Escher::SimpleTableViewDataSource,
+-                   public Escher::SelectableTableViewDelegate {
++/* GLOUTON home screen: a hungry jelly creature lives in the calculator and
++ * eats the apps to open them (see glouton/shell.cpp). This controller only
++ * bridges the creature with Escher: events in, frames and drawing out, and
++ * opening the calculator apps and the games. */
++class Controller : public Escher::ViewController {
+  public:
+   Controller(Escher::Responder* parentResponder,
+              Escher::SelectableTableViewDataSource* selectionDataSource);
++  ~Controller();
+ 
+   Escher::View* view() override { return &m_view; }
+-
+   bool handleEvent(Ion::Events::Event event) override;
+-
+-  int numberOfRows() const override {
+-    return ((numberOfIcons() - 1) / k_numberOfColumns) + 1;
+-  }
+-  int numberOfColumns() const override { return k_numberOfColumns; }
+-  Escher::HighlightCell* reusableCell(int index) override;
+-  int reusableCellCount() const override { return k_numberOfReusableCells; }
+-  void fillCellForLocation(Escher::HighlightCell* cell, int column,
+-                           int row) override;
+-  bool canSelectCellAtLocation(int column, int row) override {
+-    assert(column >= 0 && column < numberOfColumns() && row >= 0 &&
+-           row < numberOfRows());
+-    return row < numberOfRows() - 1 || column <= columnOfLastIcon();
+-  }
+-  void tableViewDidChangeSelectionAndDidScroll(
+-      Escher::SelectableTableView* t, int previousSelectedCol,
+-      int previousSelectedRow, KDPoint previousOffset,
+-      bool withinTemporarySelection) override;
++  // Called by the run loop every framePeriod() ms
++  bool frame();
++  int framePeriod();
+ 
+  protected:
+   void handleResponderChainEvent(ResponderChainEvent event) override;
+ 
+  private:
+-  // SimpleTableViewDataSource
+-  KDCoordinate defaultRowHeight() override { return k_cellHeight; }
+-  KDCoordinate defaultColumnWidth() override { return k_cellWidth; }
++  class ContentView : public Escher::View {
++   public:
++    void drawRect(KDContext* ctx, KDRect rect) const override;
++    void invalidateAll() { markRectAsDirty(bounds()); }
++  };
+ 
+-  int numberOfIcons() const;
+-  Escher::SelectableTableViewDataSource* selectionDataSource() const;
+-  void switchToSelectedApp();
++  void launch();
+   bool appIsForbidden(I18n::Message appName) const;
+   I18n::Message forbiddenAppMessage() const;
+ 
+-  // Conversion index <--> column/row
+-  int columnOfIconAtIndex(int iconIndex) const {
+-    return iconIndex % k_numberOfColumns;
+-  }
+-  int rowOfIconAtIndex(int iconIndex) const {
+-    return iconIndex / k_numberOfColumns;
+-  }
+-  int indexOfIconAtColumnAndRow(int column, int row) const {
+-    return row * k_numberOfColumns + column;
+-  }
+-  int indexOfAppAtColumnAndRow(int column, int row) const {
+-    return indexOfIconAtColumnAndRow(column, row) + 1;
+-  }
+-  int columnOfLastIcon() { return columnOfIconAtIndex(numberOfIcons() - 1); }
+-
+-  class ContentView : public Escher::View {
+-   public:
+-    ContentView(Controller* controller,
+-                Escher::SelectableTableViewDataSource* selectionDataSource);
+-    Escher::SelectableTableView* selectableTableView();
+-    void drawRect(KDContext* ctx, KDRect rect) const override {
+-      ctx->fillRect(bounds(), Escher::ColorPicker::Resolve(
+-                                  Escher::ThemeComponent::DefaultBackground));
+-    }
+-    void reload() { markWholeFrameAsDirty(); }
+-    void reloadBottomRow(SimpleTableViewDataSource* dataSource,
+-                         int lastIconColumn);
+-
+-   private:
+-    int numberOfSubviews() const override { return 1; }
+-    View* subviewAtIndex(int index) override;
+-    void layoutSubviews(bool force = false) override;
+-    Escher::SelectableTableView m_selectableTableView;
+-  };
+-  constexpr static KDMargins k_margins = {4, 4, 0, 0};
+-  constexpr static KDCoordinate k_bottomMargin = 14;
+-  constexpr static KDCoordinate k_indicatorMargin = 61;
+-  constexpr static int k_numberOfColumns = 3;
+-  constexpr static int k_numberOfReusableCells = 6;
+-  constexpr static int k_cellHeight = 104;
+-  constexpr static int k_cellWidth = 104;
++  bool m_active;
+   ContentView m_view;
+-  AppCell m_reusableCells[k_numberOfReusableCells];
+ };
+ 
+ }  // namespace Home
+diff --git a/epsilon/apps/home/glouton/blob.cpp b/epsilon/apps/home/glouton/blob.cpp
+new file mode 100644
+index 0000000000..946f5e5302
+--- /dev/null
++++ b/epsilon/apps/home/glouton/blob.cpp
+@@ -0,0 +1,314 @@
++#include "blob.h"
++
++#include <math.h>
++
++namespace Home {
++namespace Glouton {
++
++namespace {
++constexpr float k_twoPi = 6.2831853f;
++constexpr int k_substeps = 4;
++constexpr float k_internalDamping = 7.f;  // 1/s, damps the wobble only
++constexpr float k_maxSpeed = 210.f;       // px/s, horizontal
++}  // namespace
++
++void Blob::init(float x, float y, float radius) {
++  m_radius = m_targetRadius = radius;
++  m_inflation = 1.f;
++  m_stiffness = 520.f;
++  for (int i = 0; i < k_points; i++) {
++    float a = k_twoPi * i / k_points;
++    m_restX[i] = cosf(a);
++    m_restY[i] = sinf(a);
++    m_px[i] = x + m_restX[i] * radius;
++    m_py[i] = y + m_restY[i] * radius;
++    m_vx[i] = m_vy[i] = 0;
++  }
++  m_groundTime = 1.f;
++  m_impact = 0;
++  updateShape();
++}
++
++void Blob::updateShape() {
++  float sx = 0, sy = 0, svx = 0, svy = 0;
++  float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
++  for (int i = 0; i < k_points; i++) {
++    sx += m_px[i];
++    sy += m_py[i];
++    svx += m_vx[i];
++    svy += m_vy[i];
++    minX = m_px[i] < minX ? m_px[i] : minX;
++    maxX = m_px[i] > maxX ? m_px[i] : maxX;
++    minY = m_py[i] < minY ? m_py[i] : minY;
++    maxY = m_py[i] > maxY ? m_py[i] : maxY;
++  }
++  m_cx = sx / k_points;
++  m_cy = sy / k_points;
++  m_mvx = svx / k_points;
++  m_mvy = svy / k_points;
++  m_hw = (maxX - minX) * 0.5f;
++  m_hh = (maxY - minY) * 0.5f;
++  m_minY = minY;
++  m_maxY = maxY;
++}
++
++void Blob::moveTo(float x, float y) {
++  float dx = x - m_cx, dy = y - m_cy;
++  for (int i = 0; i < k_points; i++) {
++    m_px[i] += dx;
++    m_py[i] += dy;
++  }
++  updateShape();
++}
++
++void Blob::impulse(float vx, float vy) {
++  for (int i = 0; i < k_points; i++) {
++    m_vx[i] += vx;
++    m_vy[i] += vy;
++  }
++  updateShape();
++}
++
++void Blob::jiggle(float strength, uint32_t seed) {
++  for (int i = 0; i < k_points; i++) {
++    seed = seed * 1664525u + 1013904223u;
++    float r = ((seed >> 8) & 0xFFFF) / 65535.f - 0.5f;
++    m_vx[i] += m_restX[i] * strength * r * 2.f;
++    m_vy[i] += m_restY[i] * strength * r * 2.f;
++  }
++}
++
++void Blob::squeeze(float amount) {
++  for (int i = 0; i < k_points; i++) {
++    float dx = m_px[i] - m_cx, dy = m_py[i] - m_cy;
++    m_vx[i] += dx * amount;
++    m_vy[i] -= dy * amount;
++  }
++}
++
++void Blob::step(float dt, const Env& env, const Control& c) {
++  if (dt <= 0) {
++    return;
++  }
++  // The radius grows (or shrinks) smoothly
++  m_radius += (m_targetRadius - m_radius) * (dt * 3.f > 1.f ? 1.f : dt * 3.f);
++  float down = env.gravity >= 0 ? 1.f : -1.f;
++  float g = fabsf(env.gravity);
++  float h = dt / k_substeps;
++  bool groundedNow = grounded();
++  if (c.jump && groundedNow) {
++    float v = sqrtf(2.f * g * env.jumpHeight);
++    for (int i = 0; i < k_points; i++) {
++      m_vy[i] = -down * v;
++    }
++    m_groundTime = 1.f;
++    // Stretch: the top leaves first
++    squeeze(-2.5f);
++  }
++  if (c.slam && !groundedNow) {
++    for (int i = 0; i < k_points; i++) {
++      m_vy[i] = down * 620.f;
++    }
++  }
++  float scale = m_radius * m_inflation;
++  float accel = groundedNow ? 900.f : 520.f;
++  for (int s = 0; s < k_substeps; s++) {
++    updateShape();
++    // Best rotation of the rest shape (2D shape matching)
++    float num = 0, den = 0;
++    for (int i = 0; i < k_points; i++) {
++      float qx = m_px[i] - m_cx, qy = m_py[i] - m_cy;
++      num += m_restX[i] * qy - m_restY[i] * qx;
++      den += m_restX[i] * qx + m_restY[i] * qy;
++    }
++    float len = sqrtf(num * num + den * den);
++    float cs = len > 1e-4f ? den / len : 1.f;
++    float sn = len > 1e-4f ? num / len : 0.f;
++    // Rising: more gravity when the jump key is released (short hops)
++    float gravity = g;
++    bool rising = m_mvy * down < 0;
++    if (rising && !c.jumpHeld) {
++      gravity *= 2.2f;
++    }
++    float damp = 1.f - env.drag * h;
++    float internal = k_internalDamping * h;
++    for (int i = 0; i < k_points; i++) {
++      float tx = m_cx + (cs * m_restX[i] - sn * m_restY[i]) * scale;
++      float ty = m_cy + (sn * m_restX[i] + cs * m_restY[i]) * scale;
++      m_vx[i] += (tx - m_px[i]) * m_stiffness * h;
++      m_vy[i] += (ty - m_py[i]) * m_stiffness * h;
++      m_vx[i] += (m_mvx - m_vx[i]) * internal;
++      m_vy[i] += (m_mvy - m_vy[i]) * internal;
++      m_vy[i] += down * gravity * h;
++      m_vx[i] += c.move * accel * h;
++      m_vx[i] *= damp;
++      m_vy[i] *= damp;
++    }
++    // Top speed
++    float svx = 0;
++    for (int i = 0; i < k_points; i++) {
++      svx += m_vx[i];
++    }
++    svx /= k_points;
++    float excess = 0;
++    if (svx > k_maxSpeed) {
++      excess = svx - k_maxSpeed;
++    } else if (svx < -k_maxSpeed) {
++      excess = svx + k_maxSpeed;
++    }
++    bool touched = false;
++    for (int i = 0; i < k_points; i++) {
++      m_vx[i] -= excess;
++      float oy = m_py[i];
++      m_px[i] += m_vx[i] * h;
++      m_py[i] += m_vy[i] * h;
++      bool contact = false;
++      float hit = 0;
++      // Floor and ceiling
++      if (m_py[i] > env.floorY) {
++        m_py[i] = env.floorY;
++        if (m_vy[i] > 0) {
++          hit = m_vy[i];
++          m_vy[i] = -m_vy[i] * env.bounce;
++        }
++        contact = down > 0;
++      } else if (m_py[i] < env.ceilY) {
++        m_py[i] = env.ceilY;
++        if (m_vy[i] < 0) {
++          hit = -m_vy[i];
++          m_vy[i] = -m_vy[i] * env.bounce;
++        }
++        contact = down < 0;
++      }
++      // One-way platforms, in the direction of gravity
++      for (int p = 0; p < env.numberOfPlatforms && !contact; p++) {
++        const Platform& pl = env.platforms[p];
++        if (m_px[i] < pl.x || m_px[i] > pl.x + pl.w) {
++          continue;
++        }
++        if (down > 0 && oy <= pl.y + 0.5f && m_py[i] > pl.y) {
++          m_py[i] = pl.y;
++          if (m_vy[i] > 0) {
++            hit = m_vy[i];
++            m_vy[i] = -m_vy[i] * env.bounce;
++          }
++          contact = true;
++        } else if (down < 0 && oy >= pl.y + 8.5f && m_py[i] < pl.y + 8) {
++          m_py[i] = pl.y + 8;
++          if (m_vy[i] < 0) {
++            hit = -m_vy[i];
++            m_vy[i] = -m_vy[i] * env.bounce;
++          }
++          contact = true;
++        }
++      }
++      if (contact) {
++        touched = true;
++        // Friction: sticky when not moving on purpose
++        float f = (c.move != 0 ? 2.f : 9.f) * h;
++        m_vx[i] -= m_vx[i] * (f > 1 ? 1 : f);
++        if (hit > m_impact) {
++          m_impact = hit;
++        }
++      }
++      // Walls
++      if (m_px[i] < env.left) {
++        m_px[i] = env.left;
++        m_vx[i] = m_vx[i] < 0 ? -m_vx[i] * 0.4f : m_vx[i];
++      } else if (m_px[i] > env.right) {
++        m_px[i] = env.right;
++        m_vx[i] = m_vx[i] > 0 ? -m_vx[i] * 0.4f : m_vx[i];
++      }
++    }
++    if (touched) {
++      m_groundTime = 0;
++    } else {
++      m_groundTime += h;
++    }
++  }
++  updateShape();
++}
++
++void Blob::render(Band& b, float camX, float camY, KDColor color, int alpha,
++                  bool glow) const {
++  // Smooth outline (Catmull-Rom, one extra point per edge), screen space
++  float sx[k_smooth], sy[k_smooth];
++  float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
++  for (int i = 0; i < k_points; i++) {
++    int i0 = (i + k_points - 1) % k_points, i2 = (i + 1) % k_points,
++        i3 = (i + 2) % k_points;
++    float x1 = m_px[i] - camX, y1 = m_py[i] - camY;
++    float x2 = m_px[i2] - camX, y2 = m_py[i2] - camY;
++    sx[2 * i] = x1;
++    sy[2 * i] = y1;
++    sx[2 * i + 1] = (-(m_px[i0] - camX) + 9 * x1 + 9 * x2 - (m_px[i3] - camX)) / 16.f;
++    sy[2 * i + 1] = (-(m_py[i0] - camY) + 9 * y1 + 9 * y2 - (m_py[i3] - camY)) / 16.f;
++  }
++  for (int i = 0; i < k_smooth; i++) {
++    minX = sx[i] < minX ? sx[i] : minX;
++    maxX = sx[i] > maxX ? sx[i] : maxX;
++    minY = sy[i] < minY ? sy[i] : minY;
++    maxY = sy[i] > maxY ? sy[i] : maxY;
++  }
++  Rect box = {static_cast<int>(minX) - 3, static_cast<int>(minY) - 3,
++              static_cast<int>(maxX - minX) + 7,
++              static_cast<int>(maxY - minY) + 7};
++  Rect z = box.intersection(b.clip());
++  if (z.isEmpty()) {
++    return;
++  }
++  float cx = m_cx - camX, cy = m_cy - camY;
++  // Outline: the same shape pushed out by 1.7 px
++  float ox[k_smooth], oy[k_smooth];
++  for (int i = 0; i < k_smooth; i++) {
++    float dx = sx[i] - cx, dy = sy[i] - cy;
++    float d = sqrtf(dx * dx + dy * dy);
++    float k = d > 0.5f ? (d + 1.7f) / d : 1.f;
++    ox[i] = cx + dx * k;
++    oy[i] = cy + dy * k;
++  }
++  KDColor outline = glow ? mix(color, rgb(0xFFFFFF), 120)
++                         : mix(color, rgb(0x0B0B1A), 190);
++  KDColor light = mix(color, rgb(0xFFFFFF), glow ? 140 : 90);
++  KDColor dark = mix(color, rgb(0x0B0B1A), glow ? 40 : 120);
++  float ihw = 1.f / (m_hw > 1 ? m_hw : 1), ihh = 1.f / (m_hh > 1 ? m_hh : 1);
++  float crossings[16];
++  for (int y = z.y; y < z.bottom(); y++) {
++    KDColor* row = b.row(y);
++    float fy = y + 0.5f;
++    int k = polygonCrossings(ox, oy, k_smooth, fy, crossings, 16);
++    for (int i = 0; i < k; i += 2) {
++      int x0 = static_cast<int>(crossings[i] + 0.5f);
++      int x1 = static_cast<int>(crossings[i + 1] + 0.5f);
++      x0 = x0 < z.x ? z.x : x0;
++      x1 = x1 > z.right() ? z.right() : x1;
++      for (int x = x0; x < x1; x++) {
++        blendPixel(row + x, outline, alpha);
++      }
++    }
++    k = polygonCrossings(sx, sy, k_smooth, fy, crossings, 16);
++    float ny = (fy - cy) * ihh;
++    for (int i = 0; i < k; i += 2) {
++      int x0 = static_cast<int>(crossings[i] + 0.5f);
++      int x1 = static_cast<int>(crossings[i + 1] + 0.5f);
++      x0 = x0 < z.x ? z.x : x0;
++      x1 = x1 > z.right() ? z.right() : x1;
++      for (int x = x0; x < x1; x++) {
++        float nx = (x + 0.5f - cx) * ihw;
++        // Lit from the top left, darker at the bottom right and on the rim
++        float t = 0.42f + 0.22f * nx + 0.38f * ny;
++        float r2 = nx * nx + ny * ny;
++        if (r2 > 0.62f) {
++          t += (r2 - 0.62f) * 0.9f;
++        }
++        int ti = static_cast<int>(t * 256);
++        KDColor c = ti < 128 ? mix(light, color, ti * 2)
++                             : mix(color, dark, (ti - 128) * 2);
++        blendPixel(row + x, c, alpha);
++      }
++    }
++  }
++}
++
++}  // namespace Glouton
++}  // namespace Home
+diff --git a/epsilon/apps/home/glouton/blob.h b/epsilon/apps/home/glouton/blob.h
+new file mode 100644
+index 0000000000..0dafad988c
+--- /dev/null
++++ b/epsilon/apps/home/glouton/blob.h
+@@ -0,0 +1,93 @@
++#pragma once
++
++/* GLOUTON's body: a real soft body.
++ *
++ * A ring of points pulled back towards their rest shape (shape matching:
++ * the best rotation of the rest circle, scaled by the inflation), with
++ * gravity, drag and collisions. Landing squashes it, jumping stretches it,
++ * poking it makes it wobble: nothing is animated by hand. */
++
++#include <stdint.h>
++
++#include "gfx.h"
++
++namespace Home {
++namespace Glouton {
++
++struct Platform {
++  int16_t x, y, w;
++};
++
++struct Env {
++  float gravity;      // px/s^2, negative: upside down
++  float drag;         // 1/s
++  float jumpHeight;   // px
++  float floorY, ceilY, left, right;
++  float bounce;       // 0..1 on the floor
++  const Platform* platforms;
++  int numberOfPlatforms;
++};
++
++struct Control {
++  float move;     // -1..1
++  bool jump;      // starts a jump (if on the ground)
++  bool jumpHeld;  // longer jumps while held
++  bool slam;      // dives towards the ground
++};
++
++class Blob {
++ public:
++  constexpr static int k_points = 20;
++  constexpr static int k_smooth = 2 * k_points;
++
++  void init(float x, float y, float radius);
++  void setRadius(float r) { m_targetRadius = r; }
++  float radius() const { return m_radius; }
++  void setInflation(float s) { m_inflation = s; }
++  float inflation() const { return m_inflation; }
++  void setStiffness(float k) { m_stiffness = k; }
++  void step(float dt, const Env& env, const Control& c);
++  void impulse(float vx, float vy);
++  // Random wobble (a poke, a chew, a burp)
++  void jiggle(float strength, uint32_t seed);
++  // Squeezes horizontally (> 0) or vertically (< 0), keeps the momentum
++  void squeeze(float amount);
++  void moveTo(float x, float y);
++
++  float x() const { return m_cx; }
++  float y() const { return m_cy; }
++  float vx() const { return m_mvx; }
++  float vy() const { return m_mvy; }
++  // Half extents of the bounding box (squash and stretch)
++  float halfWidth() const { return m_hw; }
++  float halfHeight() const { return m_hh; }
++  float top() const { return m_minY; }
++  float bottom() const { return m_maxY; }
++  bool grounded() const { return m_groundTime < 0.12f; }
++  // Speed of the last impact on the ground, then 0
++  float takeImpact() {
++    float i = m_impact;
++    m_impact = 0;
++    return i;
++  }
++
++  /* Draws the body: dark outline, then a glossy translucent jelly. `glow`
++   * makes it emissive (night). */
++  void render(Band& b, float camX, float camY, KDColor color, int alpha,
++              bool glow) const;
++
++ private:
++  void updateShape();
++
++  float m_px[k_points], m_py[k_points];
++  float m_vx[k_points], m_vy[k_points];
++  float m_restX[k_points], m_restY[k_points];  // unit circle
++  float m_radius, m_targetRadius, m_inflation, m_stiffness;
++  float m_cx, m_cy, m_mvx, m_mvy;
++  float m_hw, m_hh, m_minY, m_maxY;
++  float m_groundTime;
++  float m_impact;
++};
++
++}  // namespace Glouton
++}  // namespace Home
+diff --git a/epsilon/apps/home/glouton/food.cpp b/epsilon/apps/home/glouton/food.cpp
+new file mode 100644
+index 0000000000..cc283df42f
+--- /dev/null
++++ b/epsilon/apps/home/glouton/food.cpp
+@@ -0,0 +1,55 @@
++#include "food.h"
++
++#include <string.h>
++
++namespace Home {
++namespace Glouton {
++namespace Food {
++
++namespace {
++Entry s_ring[k_ringSize];
++uint32_t s_produced = 0;
++
++void copy(char* dst, const char* src) {
++  int n = 0;
++  if (src) {
++    while (src[n] && n < k_textSize - 1) {
++      dst[n] = src[n];
++      n++;
++    }
++    if (src[n] != 0) {
++      // Cut: never cut a UTF-8 character in two
++      while (n > 0 && (static_cast<uint8_t>(dst[n - 1]) & 0xC0) == 0x80) {
++        n--;
++      }
++      if (n > 0 && (static_cast<uint8_t>(dst[n - 1]) & 0xC0) == 0xC0) {
++        n--;
++      }
++    }
++  }
++  dst[n] = 0;
++}
++}  // namespace
++
++void push(const char* input, const char* output) {
++  if (output == nullptr || output[0] == 0) {
++    return;
++  }
++  Entry& e = s_ring[s_produced % k_ringSize];
++  copy(e.input, input);
++  copy(e.output, output);
++  s_produced++;
++}
++
++uint32_t produced() { return s_produced; }
++
++const Entry* at(uint32_t index) {
++  if (index >= s_produced || s_produced - index > k_ringSize) {
++    return nullptr;
++  }
++  return &s_ring[index % k_ringSize];
++}
++
++}  // namespace Food
++}  // namespace Glouton
++}  // namespace Home
+diff --git a/epsilon/apps/home/glouton/food.h b/epsilon/apps/home/glouton/food.h
+new file mode 100644
+index 0000000000..6d8b31489e
+--- /dev/null
++++ b/epsilon/apps/home/glouton/food.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++#include <stdint.h>
++
++/* GLOUTON eats your calculations: the Calculation app pushes every new
++ * result here, and the creature of the home screen eats them when you come
++ * back. A small ring: only the last results are kept, as text. */
++
++namespace Home {
++namespace Glouton {
++namespace Food {
++
++constexpr int k_textSize = 28;
++constexpr int k_ringSize = 8;
++
++struct Entry {
++  char input[k_textSize];
++  char output[k_textSize];
++};
++
++void push(const char* input, const char* output);
++// Number of results pushed since the calculator started
++uint32_t produced();
++// Entry number `index`, nullptr if it is not kept anymore
++const Entry* at(uint32_t index);
++
++}  // namespace Food
++}  // namespace Glouton
++}  // namespace Home
+diff --git a/epsilon/apps/home/glouton/gfx.cpp b/epsilon/apps/home/glouton/gfx.cpp
+new file mode 100644
+index 0000000000..1c90e3c6c9
+--- /dev/null
++++ b/epsilon/apps/home/glouton/gfx.cpp
+@@ -0,0 +1,658 @@
++#include "gfx.h"
++
++#include <kandinsky/context.h>
++#include <math.h>
++#include <omg/memory.h>
++#include <string.h>
++
++namespace Home {
++namespace Glouton {
++
++namespace {
++
++KDColor s_band[k_screenWidth * Band::k_maxHeight];
++
++/* Text is rasterized white on black in this buffer; the green channel is
++ * then the glyph coverage. The buffer also receives decompressed .nwa
++ * icons (never at the same time). */
++constexpr int k_textBufferWidth = 240;
++constexpr int k_textBufferHeight = 18;
++KDColor s_textBuffer[k_textBufferWidth * k_textBufferHeight];
++
++constexpr int k_nwaIconWidth = 55;
++constexpr int k_nwaIconHeight = 56;
++static_assert(k_nwaIconWidth * k_nwaIconHeight <=
++                  k_textBufferWidth * k_textBufferHeight,
++              "The text buffer must be able to hold a .nwa icon");
++
++class TextContext : public KDContext {
++ public:
++  TextContext()
++      : KDContext(KDPointZero,
++                  KDRect(0, 0, k_textBufferWidth, k_textBufferHeight)) {}
++
++ protected:
++  void pushRect(KDRect rect, const KDColor* pixels) override {
++    for (KDCoordinate j = 0; j < rect.height(); j++) {
++      memcpy(s_textBuffer + (rect.y() + j) * k_textBufferWidth + rect.x(),
++             pixels + j * rect.width(), rect.width() * sizeof(KDColor));
++    }
++  }
++  void pushRectUniform(KDRect rect, KDColor color) override {
++    for (KDCoordinate j = 0; j < rect.height(); j++) {
++      KDColor* r = s_textBuffer + (rect.y() + j) * k_textBufferWidth + rect.x();
++      for (KDCoordinate i = 0; i < rect.width(); i++) {
++        r[i] = color;
++      }
++    }
++  }
++  void pullRect(KDRect rect, KDColor* pixels) override {
++    for (KDCoordinate j = 0; j < rect.height(); j++) {
++      memcpy(pixels + j * rect.width(),
++             s_textBuffer + (rect.y() + j) * k_textBufferWidth + rect.x(),
++             rect.width() * sizeof(KDColor));
++    }
++  }
++};
++
++/* Epsilon's fonts draw accented letters as a base letter followed by a
++ * combining mark (the translations are stored that way). The GLOUTON texts
++ * are written with precomposed letters: decompose them on the fly. */
++const char* decompose(const char* s, char* buffer, int size) {
++  // Base letter and combining mark (second byte after 0xCC) for C3 80..9F
++  static constexpr char k_base[32] = {
++      'A', 'A', 'A', 0,   'A', 0,   0,   'C', 'E', 'E', 'E', 'E', 'I', 'I',
++      'I', 'I', 0,   0,   'O', 'O', 'O', 0,   'O', 0,   0,   'U', 'U', 'U',
++      'U', 0,   0,   0};
++  static constexpr uint8_t k_mark[32] = {
++      0x80, 0x81, 0x82, 0,    0x88, 0,    0,    0xA7, 0x80, 0x81, 0x82,
++      0x88, 0x80, 0x81, 0x82, 0x88, 0,    0,    0x80, 0x81, 0x82, 0,
++      0x88, 0,    0,    0x80, 0x81, 0x82, 0x88, 0,    0,    0};
++  bool needed = false;
++  for (const char* p = s; *p; p++) {
++    if (static_cast<uint8_t>(*p) == 0xC3) {
++      needed = true;
++      break;
++    }
++  }
++  if (!needed) {
++    return s;
++  }
++  int n = 0;
++  for (const char* p = s; *p && n < size - 4; p++) {
++    uint8_t c = static_cast<uint8_t>(*p);
++    uint8_t next = static_cast<uint8_t>(p[1]);
++    if (c == 0xC3 && next >= 0x80 && next <= 0xBF) {
++      int i = next >= 0xA0 ? next - 0xA0 : next - 0x80;
++      if (k_base[i]) {
++        char base = k_base[i];
++        if (next >= 0xA0) {
++          base = base - 'A' + 'a';
++        }
++        buffer[n++] = base;
++        buffer[n++] = static_cast<char>(0xCC);
++        buffer[n++] = static_cast<char>(k_mark[i]);
++        p++;
++        continue;
++      }
++    }
++    buffer[n++] = *p;
++  }
++  buffer[n] = 0;
++  return buffer;
++}
++
++// Renders s into the text buffer; returns its size
++KDSize rasterize(const char* s, KDFont::Size font) {
++  KDSize size = KDFont::Font(font)->stringSize(s);
++  int w = size.width() < k_textBufferWidth ? size.width() : k_textBufferWidth;
++  int h = size.height() < k_textBufferHeight ? size.height()
++                                             : k_textBufferHeight;
++  TextContext ctx;
++  ctx.fillRect(KDRect(0, 0, w, h), KDBlack);
++  ctx.drawString(s, KDPointZero,
++                 {.glyphColor = KDWhite,
++                  .backgroundColor = KDBlack,
++                  .font = font});
++  return KDSize(w, h);
++}
++
++/* Coverage (0..256) of the pixel (px, py) of a rounded rectangle, 0 outside.
++ * Only the corners are curved; they are antialiased on one pixel. */
++int roundCoverage(const Rect& r, int radius, int px, int py) {
++  int cx, cy;
++  if (px < r.x + radius) {
++    cx = r.x + radius;
++  } else if (px >= r.right() - radius) {
++    cx = r.right() - radius - 1;
++  } else {
++    return 256;
++  }
++  if (py < r.y + radius) {
++    cy = r.y + radius;
++  } else if (py >= r.bottom() - radius) {
++    cy = r.bottom() - radius - 1;
++  } else {
++    return 256;
++  }
++  float dx = (px - cx) + (px < cx ? 0.5f : -0.5f);
++  float dy = (py - cy) + (py < cy ? 0.5f : -0.5f);
++  float d = sqrtf(dx * dx + dy * dy);
++  float edge = radius + 0.5f - d;
++  if (edge >= 1.f) {
++    return 256;
++  }
++  if (edge <= 0.f) {
++    return 0;
++  }
++  return static_cast<int>(edge * 256);
++}
++
++}  // namespace
++
++/* ------------------------------------------------------------------ rect */
++
++Rect Rect::intersection(const Rect& o) const {
++  int x0 = x > o.x ? x : o.x;
++  int y0 = y > o.y ? y : o.y;
++  int x1 = right() < o.right() ? right() : o.right();
++  int y1 = bottom() < o.bottom() ? bottom() : o.bottom();
++  return {x0, y0, x1 - x0, y1 - y0};
++}
++
++/* ------------------------------------------------------------------ band */
++
++void Band::begin(Rect area) {
++  m_area = area;
++  m_clip = area;
++}
++
++bool Band::setClip(Rect r) {
++  m_clip = r.intersection(m_area);
++  return !m_clip.isEmpty();
++}
++
++KDColor* Band::row(int y) const {
++  return s_band + (y - m_area.y) * m_area.w - m_area.x;
++}
++
++const KDColor* Band::pixels() const { return s_band; }
++
++/* ---------------------------------------------------------------- colors */
++
++KDColor mix(KDColor a, KDColor b, int t) {
++  if (t <= 0) {
++    return a;
++  }
++  if (t >= 256) {
++    return b;
++  }
++  return KDColor::Blend(b, a, static_cast<uint8_t>(t > 255 ? 255 : t));
++}
++
++KDColor hsv(int hue, int sat, int val) {
++  hue %= 360;
++  if (hue < 0) {
++    hue += 360;
++  }
++  int region = hue / 60;
++  int rem = (hue - region * 60) * 255 / 60;
++  int p = (val * (255 - sat)) >> 8;
++  int q = (val * (255 - ((sat * rem) >> 8))) >> 8;
++  int t = (val * (255 - ((sat * (255 - rem)) >> 8))) >> 8;
++  int r, g, b;
++  switch (region) {
++    case 0: r = val; g = t; b = p; break;
++    case 1: r = q; g = val; b = p; break;
++    case 2: r = p; g = val; b = t; break;
++    case 3: r = p; g = q; b = val; break;
++    case 4: r = t; g = p; b = val; break;
++    default: r = val; g = p; b = q; break;
++  }
++  return KDColor::RGB888(r, g, b);
++}
++
++/* ------------------------------------------------------------ primitives */
++
++void fill(Band& b, Rect r, KDColor c, int alpha) {
++  Rect z = r.intersection(b.clip());
++  if (z.isEmpty() || alpha <= 0) {
++    return;
++  }
++  for (int y = z.y; y < z.bottom(); y++) {
++    KDColor* row = b.row(y);
++    if (alpha >= 256) {
++      for (int x = z.x; x < z.right(); x++) {
++        row[x] = c;
++      }
++    } else {
++      for (int x = z.x; x < z.right(); x++) {
++        row[x] = KDColor::Blend(c, row[x], static_cast<uint8_t>(alpha));
++      }
++    }
++  }
++}
++
++void frame(Band& b, Rect r, KDColor c, int alpha) {
++  fill(b, {r.x, r.y, r.w, 1}, c, alpha);
++  fill(b, {r.x, r.bottom() - 1, r.w, 1}, c, alpha);
++  fill(b, {r.x, r.y + 1, 1, r.h - 2}, c, alpha);
++  fill(b, {r.right() - 1, r.y + 1, 1, r.h - 2}, c, alpha);
++}
++
++void roundFill(Band& b, Rect r, int radius, KDColor c, int alpha) {
++  if (radius <= 0) {
++    return fill(b, r, c, alpha);
++  }
++  Rect z = r.intersection(b.clip());
++  if (z.isEmpty() || alpha <= 0) {
++    return;
++  }
++  for (int y = z.y; y < z.bottom(); y++) {
++    KDColor* row = b.row(y);
++    bool cornerRow = y < r.y + radius || y >= r.bottom() - radius;
++    for (int x = z.x; x < z.right(); x++) {
++      int a = alpha;
++      if (cornerRow) {
++        int cov = roundCoverage(r, radius, x, y);
++        if (cov == 0) {
++          continue;
++        }
++        a = (alpha * cov) >> 8;
++      }
++      blendPixel(row + x, c, a);
++    }
++  }
++}
++
++void roundFrame(Band& b, Rect r, int radius, KDColor c, int alpha) {
++  Rect z = r.intersection(b.clip());
++  if (z.isEmpty() || alpha <= 0) {
++    return;
++  }
++  Rect inner = {r.x + 1, r.y + 1, r.w - 2, r.h - 2};
++  int innerRadius = radius > 1 ? radius - 1 : 0;
++  for (int y = z.y; y < z.bottom(); y++) {
++    KDColor* row = b.row(y);
++    for (int x = z.x; x < z.right(); x++) {
++      int outer = roundCoverage(r, radius, x, y);
++      if (outer == 0) {
++        continue;
++      }
++      int in = inner.contains(x, y) ? roundCoverage(inner, innerRadius, x, y)
++                                    : 0;
++      int cov = outer - in;
++      if (cov > 0) {
++        blendPixel(row + x, c, (alpha * cov) >> 8);
++      }
++    }
++  }
++}
++
++void disc(Band& b, int cx, int cy, int radius, KDColor c, int alpha) {
++  roundFill(b, {cx - radius, cy - radius, 2 * radius + 1, 2 * radius + 1},
++            radius, c, alpha);
++}
++
++void ellipse(Band& b, float cx, float cy, float rx, float ry, KDColor c,
++             int alpha) {
++  if (rx <= 0.2f || ry <= 0.2f || alpha <= 0) {
++    return;
++  }
++  Rect r = {static_cast<int>(floorf(cx - rx - 1)),
++            static_cast<int>(floorf(cy - ry - 1)),
++            static_cast<int>(2 * rx + 3), static_cast<int>(2 * ry + 3)};
++  Rect z = r.intersection(b.clip());
++  if (z.isEmpty()) {
++    return;
++  }
++  float irx = 1.f / rx, iry = 1.f / ry;
++  float minR = rx < ry ? rx : ry;
++  for (int y = z.y; y < z.bottom(); y++) {
++    KDColor* row = b.row(y);
++    float dy = (y + 0.5f - cy) * iry;
++    for (int x = z.x; x < z.right(); x++) {
++      float dx = (x + 0.5f - cx) * irx;
++      float d = dx * dx + dy * dy;
++      if (d >= 1.3f) {
++        continue;
++      }
++      // Distance to the edge, in pixels (approximately)
++      float edge = (1.f - sqrtf(d)) * minR + 0.5f;
++      if (edge <= 0.f) {
++        continue;
++      }
++      int a = edge >= 1.f ? alpha : static_cast<int>(alpha * edge);
++      blendPixel(row + x, c, a);
++    }
++  }
++}
++
++void line(Band& b, float x0, float y0, float x1, float y1, float thickness,
++          KDColor c, int alpha) {
++  float r = thickness * 0.5f;
++  float minX = (x0 < x1 ? x0 : x1) - r - 1, maxX = (x0 > x1 ? x0 : x1) + r + 1;
++  float minY = (y0 < y1 ? y0 : y1) - r - 1, maxY = (y0 > y1 ? y0 : y1) + r + 1;
++  Rect z = Rect{static_cast<int>(floorf(minX)), static_cast<int>(floorf(minY)),
++                static_cast<int>(maxX - minX) + 2,
++                static_cast<int>(maxY - minY) + 2}
++               .intersection(b.clip());
++  if (z.isEmpty() || alpha <= 0) {
++    return;
++  }
++  float dx = x1 - x0, dy = y1 - y0;
++  float len2 = dx * dx + dy * dy;
++  for (int y = z.y; y < z.bottom(); y++) {
++    KDColor* row = b.row(y);
++    float py = y + 0.5f;
++    for (int x = z.x; x < z.right(); x++) {
++      float px = x + 0.5f;
++      float t = len2 > 0 ? ((px - x0) * dx + (py - y0) * dy) / len2 : 0;
++      t = t < 0 ? 0 : (t > 1 ? 1 : t);
++      float ex = x0 + t * dx - px, ey = y0 + t * dy - py;
++      float d = sqrtf(ex * ex + ey * ey);
++      float edge = r + 0.5f - d;
++      if (edge <= 0) {
++        continue;
++      }
++      blendPixel(row + x, c, edge >= 1 ? alpha : static_cast<int>(alpha * edge));
++    }
++  }
++}
++
++void arc(Band& b, float cx, float cy, float r, float thickness, int half,
++         KDColor c, int alpha) {
++  float outer = r + thickness * 0.5f;
++  Rect z = Rect{static_cast<int>(floorf(cx - outer - 1)),
++                static_cast<int>(floorf(cy - outer - 1)),
++                static_cast<int>(2 * outer + 3),
++                static_cast<int>(2 * outer + 3)}
++               .intersection(b.clip());
++  if (z.isEmpty() || alpha <= 0) {
++    return;
++  }
++  for (int y = z.y; y < z.bottom(); y++) {
++    float py = y + 0.5f - cy;
++    if ((half == 1 && py > 0.5f) || (half == 2 && py < -0.5f)) {
++      continue;
++    }
++    KDColor* row = b.row(y);
++    for (int x = z.x; x < z.right(); x++) {
++      float px = x + 0.5f - cx;
++      float d = sqrtf(px * px + py * py);
++      float edge = thickness * 0.5f + 0.5f - fabsf(d - r);
++      if (edge <= 0) {
++        continue;
++      }
++      blendPixel(row + x, c, edge >= 1 ? alpha : static_cast<int>(alpha * edge));
++    }
++  }
++}
++
++int polygonCrossings(const float* xs, const float* ys, int n, float y,
++                     float* out, int max) {
++  int count = 0;
++  for (int i = 0, j = n - 1; i < n; j = i++) {
++    float yi = ys[i], yj = ys[j];
++    if ((yi <= y && yj > y) || (yj <= y && yi > y)) {
++      float x = xs[i] + (y - yi) * (xs[j] - xs[i]) / (yj - yi);
++      if (count < max) {
++        // Insertion sort
++        int k = count++;
++        while (k > 0 && out[k - 1] > x) {
++          out[k] = out[k - 1];
++          k--;
++        }
++        out[k] = x;
++      }
++    }
++  }
++  return count & ~1;
++}
++
++void polygon(Band& b, const float* xs, const float* ys, int n, KDColor c,
++             int alpha) {
++  const Rect& clip = b.clip();
++  float crossings[16];
++  for (int y = clip.y; y < clip.bottom(); y++) {
++    int k = polygonCrossings(xs, ys, n, y + 0.5f, crossings, 16);
++    KDColor* row = b.row(y);
++    for (int i = 0; i < k; i += 2) {
++      int x0 = static_cast<int>(crossings[i] + 0.5f);
++      int x1 = static_cast<int>(crossings[i + 1] + 0.5f);
++      x0 = x0 < clip.x ? clip.x : x0;
++      x1 = x1 > clip.right() ? clip.right() : x1;
++      for (int x = x0; x < x1; x++) {
++        blendPixel(row + x, c, alpha);
++      }
++    }
++  }
++}
++
++void heart(Band& b, int x, int y, int scale, KDColor c, int alpha) {
++  static constexpr uint16_t k_heart[8] = {
++      0b0110001100000000, 0b1111011110000000, 0b1111111110000000,
++      0b1111111110000000, 0b0111111100000000, 0b0011111000000000,
++      0b0001110000000000, 0b0000100000000000};
++  bitmap(b, k_heart, 9, 8, x, y, scale, c, alpha);
++}
++
++void bitmap(Band& b, const uint16_t* rows, int w, int h, int x, int y,
++            int scale, KDColor c, int alpha) {
++  Rect z = Rect{x, y, w * scale, h * scale}.intersection(b.clip());
++  if (z.isEmpty()) {
++    return;
++  }
++  for (int yy = z.y; yy < z.bottom(); yy++) {
++    uint16_t bits = rows[(yy - y) / scale];
++    KDColor* row = b.row(yy);
++    for (int xx = z.x; xx < z.right(); xx++) {
++      int bx = (xx - x) / scale;
++      if (bits & (0x8000 >> bx)) {
++        blendPixel(row + xx, c, alpha);
++      }
++    }
++  }
++}
++
++void gameIcon(Band& b, const Ion::ExternalApps::App& app, int x, int y,
++              int size) {
++  Rect z = Rect{x, y, size, size}.intersection(b.clip());
++  if (z.isEmpty()) {
++    return;
++  }
++  const uint8_t* data = app.iconData();
++  uint32_t dataSize = app.iconSize();
++  if (data == nullptr || dataSize == 0) {
++    roundFill(b, {x, y, size, size}, size / 5, rgb(0x7B2FF7));
++    return;
++  }
++  OMG::Memory::Decompress(data, reinterpret_cast<uint8_t*>(s_textBuffer),
++                          dataSize,
++                          k_nwaIconWidth * k_nwaIconHeight * sizeof(KDColor));
++  Rect r = {x, y, size, size};
++  int radius = size / 5;
++  for (int yy = z.y; yy < z.bottom(); yy++) {
++    KDColor* row = b.row(yy);
++    const KDColor* src =
++        s_textBuffer + ((yy - y) * k_nwaIconHeight / size) * k_nwaIconWidth;
++    for (int xx = z.x; xx < z.right(); xx++) {
++      int cov = roundCoverage(r, radius, xx, yy);
++      if (cov) {
++        blendPixel(row + xx, src[(xx - x) * k_nwaIconWidth / size], cov);
++      }
++    }
++  }
++}
++
++bool gameIconTexture(const Ion::ExternalApps::App& app, uint16_t* out, int w,
++                     int h) {
++  const uint8_t* data = app.iconData();
++  uint32_t dataSize = app.iconSize();
++  if (data == nullptr || dataSize == 0) {
++    return false;
++  }
++  OMG::Memory::Decompress(data, reinterpret_cast<uint8_t*>(s_textBuffer),
++                          dataSize,
++                          k_nwaIconWidth * k_nwaIconHeight * sizeof(KDColor));
++  for (int y = 0; y < h; y++) {
++    for (int x = 0; x < w; x++) {
++      out[y * w + x] = s_textBuffer[(y * k_nwaIconHeight / h) * k_nwaIconWidth +
++                                    x * k_nwaIconWidth / w];
++    }
++  }
++  return true;
++}
++
++/* ------------------------------------------------------------------ text */
++
++int glyphWidth(KDFont::Size font) { return KDFont::GlyphMaxWidth(font); }
++int glyphHeight(KDFont::Size font) { return KDFont::GlyphHeight(font); }
++
++int textWidth(const char* s, KDFont::Size font) {
++  char buffer[96];
++  s = decompose(s, buffer, sizeof(buffer));
++  return KDFont::Font(font)->stringSize(s).width();
++}
++
++void text(Band& b, const char* s, int x, int y, KDColor c, KDFont::Size font,
++          Align align, int maxWidth, int alpha) {
++  if (s == nullptr || s[0] == 0 || alpha <= 0) {
++    return;
++  }
++  char decomposed[96];
++  s = decompose(s, decomposed, sizeof(decomposed));
++  int h = glyphHeight(font);
++  if (y >= b.clip().bottom() || y + h <= b.clip().y) {
++    return;
++  }
++  constexpr int k_maxChars = 48;
++  char buffer[k_maxChars + 4];
++  int gw = glyphWidth(font);
++  int limit =
++      (maxWidth < k_textBufferWidth ? maxWidth : k_textBufferWidth) / gw;
++  int len = strlen(s);
++  if (limit <= 0) {
++    return;
++  }
++  if (len > limit || len > k_maxChars) {
++    int keep = limit < k_maxChars ? limit : k_maxChars;
++    while (keep > 0 && (static_cast<uint8_t>(s[keep]) & 0xC0) == 0x80) {
++      keep--;
++    }
++    memcpy(buffer, s, keep);
++    buffer[keep] = 0;
++    s = buffer;
++  }
++  int w = KDFont::Font(font)->stringSize(s).width();
++  if (w > k_textBufferWidth) {
++    w = k_textBufferWidth;
++  }
++  if (align == Align::Center) {
++    x -= w / 2;
++  } else if (align == Align::Right) {
++    x -= w;
++  }
++  Rect z = Rect{x, y, w, h}.intersection(b.clip());
++  if (z.isEmpty()) {
++    return;
++  }
++  rasterize(s, font);
++  for (int yy = z.y; yy < z.bottom(); yy++) {
++    KDColor* row = b.row(yy);
++    const KDColor* src = s_textBuffer + (yy - y) * k_textBufferWidth - x;
++    for (int xx = z.x; xx < z.right(); xx++) {
++      int a = src[xx].green();
++      if (a) {
++        a = a >= 252 ? 256 : a;
++        blendPixel(row + xx, c, (a * alpha) >> 8);
++      }
++    }
++  }
++}
++
++void outlinedText(Band& b, const char* s, int x, int y, KDColor c,
++                  KDFont::Size font, Align align) {
++  KDColor dark = rgb(0x0A0614);
++  text(b, s, x - 1, y, dark, font, align, k_screenWidth, 200);
++  text(b, s, x + 1, y, dark, font, align, k_screenWidth, 200);
++  text(b, s, x, y - 1, dark, font, align, k_screenWidth, 200);
++  text(b, s, x, y + 1, dark, font, align, k_screenWidth, 200);
++  text(b, s, x, y, c, font, align);
++}
++
++void bigText(Band& b, const char* s, int x, int y, int scale, KDColor c,
++             Align align, int alpha) {
++  if (s == nullptr || s[0] == 0 || alpha <= 0) {
++    return;
++  }
++  char decomposed[96];
++  s = decompose(s, decomposed, sizeof(decomposed));
++  KDSize size = KDFont::Font(KDFont::Size::Large)->stringSize(s);
++  int w = (size.width() < k_textBufferWidth ? size.width() : k_textBufferWidth);
++  int h = size.height() < k_textBufferHeight ? size.height()
++                                             : k_textBufferHeight;
++  if (align == Align::Center) {
++    x -= w * scale / 2;
++  } else if (align == Align::Right) {
++    x -= w * scale;
++  }
++  Rect z = Rect{x, y, w * scale, h * scale}.intersection(b.clip());
++  if (z.isEmpty()) {
++    return;
++  }
++  rasterize(s, KDFont::Size::Large);
++  for (int yy = z.y; yy < z.bottom(); yy++) {
++    KDColor* row = b.row(yy);
++    const KDColor* src = s_textBuffer + ((yy - y) / scale) * k_textBufferWidth;
++    for (int xx = z.x; xx < z.right(); xx++) {
++      int a = src[(xx - x) / scale].green();
++      if (a) {
++        a = a >= 252 ? 256 : a;
++        blendPixel(row + xx, c, (a * alpha) >> 8);
++      }
++    }
++  }
++}
++
++void glyphMask(const char* s, uint32_t* mask) {
++  for (int i = 0; i < 32; i++) {
++    mask[i] = 0;
++  }
++  if (s == nullptr || s[0] == 0) {
++    return;
++  }
++  char decomposed[48];
++  s = decompose(s, decomposed, sizeof(decomposed));
++  KDSize size = rasterize(s, KDFont::Size::Large);
++  int w = size.width(), h = size.height();
++  if (w <= 0 || h <= 0) {
++    return;
++  }
++  // Fit in 26 x 22 texels, centred, keeping the aspect ratio
++  float scale = 26.f / w;
++  if (22.f / h < scale) {
++    scale = 22.f / h;
++  }
++  int dw = static_cast<int>(w * scale), dh = static_cast<int>(h * scale);
++  int ox = (32 - dw) / 2, oy = (32 - dh) / 2 + 1;
++  for (int y = 0; y < dh; y++) {
++    int sy0 = static_cast<int>(y / scale), sy1 = static_cast<int>((y + 1) / scale);
++    for (int x = 0; x < dw; x++) {
++      int sx0 = static_cast<int>(x / scale), sx1 = static_cast<int>((x + 1) / scale);
++      int best = 0;
++      for (int sy = sy0; sy <= sy1 && sy < h; sy++) {
++        for (int sx = sx0; sx <= sx1 && sx < w; sx++) {
++          int g = s_textBuffer[sy * k_textBufferWidth + sx].green();
++          best = g > best ? g : best;
++        }
++      }
++      if (best > 140) {
++        mask[oy + y] |= 0x80000000u >> (ox + x);
++      }
++    }
++  }
++}
++
++}  // namespace Glouton
++}  // namespace Home
+diff --git a/epsilon/apps/home/glouton/gfx.h b/epsilon/apps/home/glouton/gfx.h
+new file mode 100644
+index 0000000000..74d8c696c4
+--- /dev/null
++++ b/epsilon/apps/home/glouton/gfx.h
+@@ -0,0 +1,119 @@
++#pragma once
++
++/* GLOUTON drawing primitives.
++ *
++ * The screen is composed in RAM one horizontal band at a time (terrarium,
++ * creature, HUD, menus) and every finished band is pushed to the LCD in one
++ * go: no flicker, no tearing between layers. */
++
++#include <ion/display.h>
++#include <ion/external_apps.h>
++#include <kandinsky/color.h>
++#include <kandinsky/font.h>
++#include <stdint.h>
++
++namespace Home {
++namespace Glouton {
++
++constexpr int k_screenWidth = Ion::Display::Width;
++constexpr int k_screenHeight = Ion::Display::Height;
++
++struct Rect {
++  int x, y, w, h;
++  int right() const { return x + w; }
++  int bottom() const { return y + h; }
++  bool isEmpty() const { return w <= 0 || h <= 0; }
++  bool contains(int px, int py) const {
++    return px >= x && py >= y && px < x + w && py < y + h;
++  }
++  Rect intersection(const Rect& o) const;
++};
++
++constexpr Rect k_screen = {0, 0, k_screenWidth, k_screenHeight};
++
++class Band {
++ public:
++  constexpr static int k_maxHeight = 12;
++  void begin(Rect area);
++  const Rect& area() const { return m_area; }
++  const Rect& clip() const { return m_clip; }
++  bool setClip(Rect r);
++  void resetClip() { m_clip = m_area; }
++  // Pointer to pixel (0, y) of the band, valid for x in [area.x, area.right)
++  KDColor* row(int y) const;
++  const KDColor* pixels() const;
++
++ private:
++  Rect m_area;
++  Rect m_clip;
++};
++
++enum class Align : uint8_t { Left, Center, Right };
++
++inline KDColor rgb(uint32_t c) { return KDColor::RGB24(c); }
++inline int clampi(int v, int lo, int hi) {
++  return v < lo ? lo : (v > hi ? hi : v);
++}
++inline void blendPixel(KDColor* p, KDColor c, int alpha) {
++  if (alpha >= 256) {
++    *p = c;
++  } else if (alpha > 0) {
++    *p = KDColor::Blend(c, *p, static_cast<uint8_t>(alpha > 255 ? 255 : alpha));
++  }
++}
++KDColor mix(KDColor a, KDColor b, int t256);  // t = 0 -> a, 256 -> b
++KDColor hsv(int hue, int sat, int val);       // hue 0..359, sat/val 0..255
++
++void fill(Band& b, Rect r, KDColor c, int alpha = 256);
++void roundFill(Band& b, Rect r, int radius, KDColor c, int alpha = 256);
++void roundFrame(Band& b, Rect r, int radius, KDColor c, int alpha = 256);
++void frame(Band& b, Rect r, KDColor c, int alpha = 256);
++void disc(Band& b, int cx, int cy, int radius, KDColor c, int alpha = 256);
++// Antialiased ellipse
++void ellipse(Band& b, float cx, float cy, float rx, float ry, KDColor c,
++             int alpha = 256);
++// Thick segment with round ends
++void line(Band& b, float x0, float y0, float x1, float y1, float thickness,
++          KDColor c, int alpha = 256);
++/* Circle outline; half = 0 full, 1 upper half only (an arch: happy closed
++ * eyes), 2 lower half only (a smile) */
++void arc(Band& b, float cx, float cy, float r, float thickness, int half,
++         KDColor c, int alpha = 256);
++// Filled polygon (even-odd rule), screen coordinates
++void polygon(Band& b, const float* xs, const float* ys, int n, KDColor c,
++             int alpha = 256);
++/* Sorted x coordinates where the row y + 0.5 crosses the polygon, returns
++ * how many (at most `max`) */
++int polygonCrossings(const float* xs, const float* ys, int n, float y,
++                     float* out, int max);
++// Small heart (9 x 8) scaled
++void heart(Band& b, int x, int y, int scale, KDColor c, int alpha = 256);
++// 1-bit bitmap, rows of `w` bits (MSB first, w <= 16), scaled by `scale`
++void bitmap(Band& b, const uint16_t* rows, int w, int h, int x, int y,
++            int scale, KDColor c, int alpha = 256);
++// Icon of an external app (.nwa), scaled to size x size
++void gameIcon(Band& b, const Ion::ExternalApps::App& app, int x, int y,
++              int size);
++// Decompresses the icon of a .nwa into a w x h RGB565 texture
++bool gameIconTexture(const Ion::ExternalApps::App& app, uint16_t* out, int w,
++                     int h);
++// Text whose top-left corner is (x, y)
++void text(Band& b, const char* s, int x, int y, KDColor c,
++          KDFont::Size font = KDFont::Size::Small, Align align = Align::Left,
++          int maxWidth = k_screenWidth, int alpha = 256);
++// Text with a 1 px dark outline, readable over the 3D world
++void outlinedText(Band& b, const char* s, int x, int y, KDColor c,
++                  KDFont::Size font = KDFont::Size::Small,
++                  Align align = Align::Left);
++// Large-font text scaled up by an integer factor (titles, the logo)
++void bigText(Band& b, const char* s, int x, int y, int scale, KDColor c,
++             Align align = Align::Left, int alpha = 256);
++int textWidth(const char* s, KDFont::Size font = KDFont::Size::Small);
++int glyphWidth(KDFont::Size font = KDFont::Size::Small);
++int glyphHeight(KDFont::Size font = KDFont::Size::Small);
++/* Rasterizes `s` (centered) into a 32 x 32 1-bit mask (32 words), scaled up
++ * from the large font: the symbols drawn on the portals. */
++void glyphMask(const char* s, uint32_t* mask);
++
++}  // namespace Glouton
++}  // namespace Home
+diff --git a/epsilon/apps/home/glouton/shell.cpp b/epsilon/apps/home/glouton/shell.cpp
+new file mode 100644
+index 0000000000..5d1e3d13e1
+--- /dev/null
++++ b/epsilon/apps/home/glouton/shell.cpp
+@@ -0,0 +1,3798 @@
++#include "shell.h"
++
++#include <apps/apps_container.h>
++#include <apps/exam_mode_manager.h>
++#include <apps/global_preferences.h>
++#include <apps/home/apps_layout.h>
++#include <apps/i18n.h>
++#include <ion.h>
++#include <ion/backlight.h>
++#include <ion/battery.h>
++#include <ion/display.h>
++#include <ion/keyboard.h>
++#include <ion/led.h>
++#include <ion/timing.h>
++#include <math.h>
++#include <string.h>
++
++#include "blob.h"
++#include "food.h"
++#if !PLATFORM_DEVICE
++#include <stdio.h>
++#include <stdlib.h>
++#endif
++
++namespace Home {
++namespace Glouton {
++
++namespace {
++
++namespace Events = Ion::Events;
++using Ion::Events::Event;
++using Ion::Keyboard::Key;
++using KDFont::Size::Large;
++using KDFont::Size::Small;
++
++constexpr float k_pi = 3.14159265f;
++constexpr float k_floorY = 212.f;
++constexpr float k_ceilY = 3.f;
++constexpr float k_tongueRange = 150.f;
++constexpr int k_maxBuiltin = 16;
++constexpr int k_maxGames = 8;
++constexpr int k_maxItems = k_maxBuiltin + k_maxGames;
++constexpr int k_maxPlatforms = 8;
++constexpr int k_maxParticles = 90;
++constexpr int k_maxPellets = 6;
++constexpr int k_maxMinis = 7;
++constexpr int k_maxBites = 7;
++constexpr int k_numberOfStages = 4;
++constexpr int k_numberOfCostumes = 7;
++
++/* ================================================================ types */
++
++enum class Mode : uint8_t { Boot, World, Fridge, Notebook, Digest };
++enum class Face : uint8_t {
++  Happy,
++  Joy,
++  Sleep,
++  Angry,
++  Sick,
++  Love,
++  Wow,
++  Evil,
++  Hungry,
++  Chew,
++  Dizzy
++};
++enum class Biome : uint8_t {
++  Garden = 0,
++  Night,
++  Volcano,
++  Space,
++  Aquarium,
++  Disco,
++  Count
++};
++constexpr int k_numberOfBiomes = static_cast<int>(Biome::Count);
++enum class EatPhase : uint8_t { None, TongueOut, TongueBack, Fly, Chew, Burp };
++enum class Meal : uint8_t { Nothing, Item, Pellet };
++enum class FoodKind : uint8_t { Number, Undef, Infinity, Other };
++
++enum class PKind : uint8_t {
++  Confetti,
++  Spark,
++  Zzz,
++  Bubble,
++  Ember,
++  Heart,
++  Crumb,
++  Note,
++  Drop,
++  Steam,
++  Firefly,
++  Dust
++};
++
++struct Particle {
++  float x, y, vx, vy;  // world
++  uint16_t life, maxLife;  // ms
++  PKind kind;
++  uint8_t size;
++  uint16_t rgb565;  // not a KDColor: no static constructor
++  KDColor color() const { return KDColor::RGB16(rgb565); }
++};
++
++struct Pellet {
++  bool active;
++  float x, y, vx, vy;
++  char text[14];
++  char input[Food::k_textSize];
++  char output[Food::k_textSize];
++};
++
++struct Mini {
++  float x, y, vx, vy;
++  float squash;
++  float phase;
++};
++
++struct Bite {
++  int16_t x, y, r;
++};
++
++struct Message {
++  char text[100];
++  Face face;
++  uint16_t duration;  // ms
++};
++
++struct ItemSlot {
++  Item item;
++  const struct AppInfo* info;
++  float x, y;
++  int hue;
++};
++
++/* ================================================================ texts */
++
++struct AppInfo {
++  I18n::Message name;
++  const char* symbol;
++  int16_t hue;  // -1: grey
++  const char* sniff;
++  const char* back;
++};
++
++constexpr AppInfo k_appInfos[] = {
++    {I18n::Message::CalculApp, "1+1", 38,
++     "Calculs... mon resto\npr\xC3\xA9""f\xC3\xA9r\xC3\xA9.",
++     "Alors ?! Donne-moi\ntes r\xC3\xA9sultats !"},
++    {I18n::Message::FunctionApp, "f(x)", 200,
++     "\xC3\x87""a sent la parabole.",
++     "Jolies courbes. Les\nmiennes sont mieux."},
++    {I18n::Message::SolverApp, "x=?", 280,
++     "\xC3\x89quations : je trouve x,\ntu prends le cr\xC3\xA9""dit.",
++     "Tu as trouv\xC3\xA9 x ?\nIl \xC3\xA9tait o\xC3\xB9 ?"},
++    {I18n::Message::StatsApp, "\xCE\xA3", 330,
++     "87 % des stats sont\ninvent\xC3\xA9""es.",
++     "Moyenne de ton absence :\nbeaucoup trop."},
++    {I18n::Message::DistributionsApp, "P(X)", 12,
++     "50 % de chances que\nce soit bon.",
++     "Probabilit\xC3\xA9 que j'aie\nfaim : 100 %."},
++    {I18n::Message::SequenceApp, "u(n)", 95,
++     "u(n+1) = encore\nplus faim.", "La suite logique ?\nMe nourrir."},
++    {I18n::Message::RegressionApp, "y=ax", 168, "Une droite. Croquante.",
++     "Tes points sont align\xC3\xA9s.\nPas mon estomac."},
++    {I18n::Message::InferenceApp, "p<\xCE\xB1", 250,
++     "Hypoth\xC3\xA8se nulle : je n'ai\npas faim. FAUX.",
++     "Test rejet\xC3\xA9.\nComme mon r\xC3\xA9gime."},
++    {I18n::Message::FinanceApp, "%", 52,
++     "\xC3\x87""a sent l'argent.\n\xC3\x87""a se mange ?",
++     "Riche ? Ach\xC3\xA8te-moi\ndes bonbons."},
++    {I18n::Message::CodeApp, ">>>", 215, "Python ! \xC3\x87""a sent\nle serpent.",
++     "Tu as cod\xC3\xA9 ? J'ai vu\nun bug passer."},
++    {I18n::Message::ElementsApp, "Fe", 0, "Du fer. Bon pour\nma sant\xC3\xA9.",
++     "Le tableau p\xC3\xA9riodique,\n\xC3\xA7""a se mange ?"},
++    {I18n::Message::SettingsApp, "Cfg", -1,
++     "Les r\xC3\xA9glages. Pas\ntr\xC3\xA8s go\xC3\xBBteux.",
++     "Tu as touch\xC3\xA9 \xC3\xA0 mes\nr\xC3\xA9glages ?!"},
++};
++
++constexpr const char* k_intro[] = {
++    "BWAAAH ! Je suis GLOUTON.\nEt j'ai FAIM.",
++    "Tes applis ? Ce sont mes\nbonbons. OK = je mange.",
++    "Fais des calculs : je mange\naussi tes r\xC3\xA9sultats !",
++    "< > bouger, haut = sauter.\nRetour = le frigo.",
++    "Et essaie les touches de\nmaths : x^2, \xC3\x97, sin, i...",
++};
++
++constexpr const char* k_jokes[] = {
++    "Pourquoi 6 a peur de 7 ?\nParce que 7 8 9. MIAM.",
++    "\xCF\x80 n'a pas de fin.\nMon app\xC3\xA9tit non plus.",
++    "J'ai mang\xC3\xA9 un 0.\nJe n'ai rien senti.",
++    "Il y a 10 sortes de gens :\nceux qui me nourrissent...",
++    "Une fraction est entr\xC3\xA9""e\ndans un bar. Je l'ai mang\xC3\xA9""e.",
++    "Je suis une calculatrice.\nJe compte sur toi.",
++    "Mon r\xC3\xAAve ? Manger\nl'infini. Une fois.",
++    "Le chiffre 8 ? C'est un 0\nqui a trop mang\xC3\xA9. Respect.",
++    "Les nombres premiers,\nc'est sans gluten.",
++    "Pourquoi je suis vert ?\nTrop de l\xC3\xA9gumes. Faux.",
++};
++
++constexpr const char* k_idleLines[] = {
++    "Tu comptes rester plant\xC3\xA9\nl\xC3\xA0 ?",
++    "Je m'ennuie...\nCalcule-moi un truc.",
++    "*grouiiik*\nC'\xC3\xA9tait mon ventre.",
++    "J'ai compt\xC3\xA9 tous les pixels.\nIl y en a 76 800. Miam.",
++    "Tu savais que je suis\nfait \xC3\xA0 99 % de gel\xC3\xA9""e ?",
++    "Psst. Appuie sur x^2.\nJuste pour voir.",
++};
++
++constexpr const char* k_hungryLines[] = {
++    "*GROOOAR*\n...c'\xC3\xA9tait mon ventre.",
++    "J'ai faim. Fais un calcul.\nN'importe lequel. VITE.",
++    "Je pourrais manger\nune matrice 10\xC3\x97""10.",
++    "Nourris-moi ou je mange\nta batterie.",
++};
++
++constexpr const char* k_spit[] = {"PTOU !", "BLEURGH !", "*hips*",
++                                  "Re-coucou !"};
++
++constexpr const char* k_stageNames[k_numberOfStages] = {
++    "B\xC3\xA9""b\xC3\xA9 Glouton", "Glouton Ado", "Glouton Adulte",
++    "GLOUTON SUPR\xC3\x8AME"};
++constexpr int k_stageXp[k_numberOfStages] = {0, 5, 14, 30};
++constexpr float k_stageRadius[k_numberOfStages] = {17.f, 21.f, 25.f, 28.f};
++
++constexpr const char* k_costumeNames[k_numberOfCostumes] = {
++    "Tout nu",       "Chapeau de f\xC3\xAAte", "Haut-de-forme",
++    "Couronne",      "Lunettes de star",       "Moustache",
++    "Aur\xC3\xA9ole"};
++
++struct BiomeInfo {
++  const char* name;
++  const char* line;
++  float gravity, drag, jump, bounce;
++  uint32_t skyTop, skyBottom, far, nearLayer, ground, edge;
++};
++
++constexpr BiomeInfo k_biomes[k_numberOfBiomes] = {
++    {"JARDIN", "Ah, l'air frais !\n\xC3\x87""a creuse.", 900, 0.3f, 88,
++     0.12f, 0x3FA8EE, 0xCDEFFF, 0x8CCB80, 0x5DAA4F, 0x6B4A2B, 0x5DBA48},
++    {"NUIT", "Il fait noir... je brille !\nJe suis phosphorescent.", 900,
++     0.3f, 88, 0.12f, 0x04061A, 0x262A66, 0x1A2152, 0x0F1436, 0x121736,
++     0x34408A},
++    {"VOLCAN", "\xC3\x87""a chauffe sous mes\npieds ! A\xC3\x8F""E A\xC3\x8F""E !",
++     900, 0.3f, 88, 0.55f, 0x1A0404, 0xFF7A2E, 0x5A1E14, 0x2E120E,
++     0x221312, 0xFF5A1F},
++    {"ESPACE", "Je flotte ! La gravit\xC3\xA9,\nc'est surfait.", 240, 0.05f,
++     150, 0.35f, 0x000004, 0x0D0B2A, 0x1B1A3A, 0x2A2940, 0x8E8E9E,
++     0xC6C6D2},
++    {"AQUARIUM", "Blub. Blub blub.\n(Je sais pas nager.)", 320, 1.4f, 95,
++     0.1f, 0x0D78B0, 0x062C4C, 0x0B4766, 0x08354F, 0xDCC48C, 0xF2DFAE},
++    {"DISCO", "C'EST LA F\xC3\x8ATE !!!\nJe ne m'arr\xC3\xAAte plus.", 900,
++     0.3f, 92, 0.3f, 0x0E0018, 0x3A0A55, 0x220638, 0x16042A, 0x1A0A26,
++     0xFF3EC8},
++};
++
++/* ================================================================ state */
++
++struct State {
++  bool initialized;
++  bool introDone;
++  Mode mode;
++  Biome biome;
++  uint32_t now, last, lastInput, modeStart, birth, detachTime;
++  uint32_t random;
++  // Creature
++  Blob blob;
++  int8_t facing;
++  bool jumpRequest, slamRequest;
++  float hunger;  // 0..100
++  int xp, stage;
++  int weight;  // grams
++  int numbersEaten, appsEaten;
++  uint8_t appMeals[k_maxItems];
++  char lastMeal[16];
++  int costume;
++  bool tanned, ghost, flipped, sleeping;
++  uint32_t sickUntil, evilUntil, angryUntil, danceUntil, partyUntil,
++      faceUntil, hugeUntil, popStart, evolveStart, flashUntil, shakeUntil,
++      tintUntil, irisStart, blinkAt, nextIdle, nextHungry, nextBite,
++      hotSince, lastPoke;
++  Face faceOverride;
++  float shakeAmp;
++  float inflation;
++  int pokes;
++  uint16_t tint;
++  bool popping;
++  // Eating
++  EatPhase eat;
++  Meal meal;
++  uint32_t eatStart;
++  int eatIndex;
++  float eatFromX, eatFromY, eatToX, eatToY;
++  Pellet eaten;
++  int8_t targetKind;  // 0 none, 1 item, 2 pellet
++  int8_t targetIndex;
++  int goneItem;
++  int lastLaunched;  // item index, -1
++  int launches;
++  // World
++  float camX, camTarget;
++  float worldWidth;
++  Pellet pellets[k_maxPellets];
++  uint32_t foodSeen;
++  Mini minis[k_maxMinis];
++  int numberOfMinis;
++  Bite bites[k_maxBites];
++  int numberOfBites;
++  Particle particles[k_maxParticles];
++  // Speech
++  Message message;
++  uint32_t messageStart;
++  Message queue[6];
++  int queueLength;
++  // UI
++  bool hud;
++  int menuSelected;
++  int notebookPage;
++  bool ledOn, lightOn;
++  uint16_t ledLast;
++  bool ledSet;
++  int brightness, userBrightness;
++  uint8_t jokeIndex;
++  bool discoUnlocked;
++};
++
++State s;
++bool s_attached = false;
++Item s_launch = k_noItem;
++
++ItemSlot s_items[k_maxItems];
++int s_numberOfItems = 0;
++int s_numberOfBuiltin = 0;
++Platform s_platforms[k_maxPlatforms];
++int s_numberOfPlatforms = 0;
++
++// Per frame background data
++KDColor s_sky[k_screenHeight];
++int16_t s_far[k_screenWidth];
++int16_t s_near[k_screenWidth];
++
++/* The simulator's photo session (screenshots for the README) drives the
++ * clock and the keyboard itself. */
++bool s_fake = false;
++uint32_t s_fakeClock = 0;
++uint64_t s_fakeKeys = 0;
++
++uint32_t clockMs() {
++  return s_fake ? s_fakeClock : static_cast<uint32_t>(Ion::Timing::millis());
++}
++
++Ion::Keyboard::State scanKeys() {
++  return s_fake ? Ion::Keyboard::State(s_fakeKeys) : Ion::Keyboard::scan();
++}
++
++uint32_t rnd() {
++  s.random ^= s.random << 13;
++  s.random ^= s.random >> 17;
++  s.random ^= s.random << 5;
++  return s.random;
++}
++
++float frnd() { return (rnd() & 0xFFFF) / 65535.f; }
++
++uint32_t hash(uint32_t x) {
++  x ^= x >> 16;
++  x *= 0x7feb352dU;
++  x ^= x >> 15;
++  x *= 0x846ca68bU;
++  x ^= x >> 16;
++  return x;
++}
++
++template <typename T, int N>
++constexpr int count(T (&)[N]) {
++  return N;
++}
++
++bool examMode() {
++  return ExamModeManager::ExamMode().ruleset() != Ion::ExamMode::Ruleset::Off;
++}
++
++/* --------------------------------------------------------------- strings */
++
++struct Str {
++  char* buf;
++  int size;
++  int len;
++  Str(char* b, int sz) : buf(b), size(sz), len(0) { buf[0] = 0; }
++  Str& add(const char* t) {
++    while (t && *t && len < size - 1) {
++      buf[len++] = *t++;
++    }
++    buf[len] = 0;
++    return *this;
++  }
++  Str& addInt(long v) {
++    char tmp[16];
++    int n = 0;
++    bool neg = v < 0;
++    unsigned long u = neg ? -v : v;
++    do {
++      tmp[n++] = '0' + u % 10;
++      u /= 10;
++    } while (u && n < 15);
++    if (neg) {
++      add("-");
++    }
++    while (n > 0 && len < size - 1) {
++      buf[len++] = tmp[--n];
++    }
++    buf[len] = 0;
++    return *this;
++  }
++};
++
++bool contains(const char* text, const char* word) {
++  for (; *text; text++) {
++    const char* a = text;
++    const char* w = word;
++    while (*w && *a == *w) {
++      a++;
++      w++;
++    }
++    if (*w == 0) {
++      return true;
++    }
++  }
++  return false;
++}
++
++/* Parses a serialized result ("42", "-3.5", "1.2\xE1\xB4\x87""15") */
++bool parseNumber(const char* t, double* value) {
++  const char* p = t;
++  bool neg = false;
++  if (*p == '-') {
++    neg = true;
++    p++;
++  } else if (static_cast<uint8_t>(p[0]) == 0xE2 &&
++             static_cast<uint8_t>(p[1]) == 0x88 &&
++             static_cast<uint8_t>(p[2]) == 0x92) {
++    neg = true;
++    p += 3;
++  }
++  double v = 0;
++  int digits = 0;
++  while ((*p >= '0' && *p <= '9') || *p == ' ' ||
++         (static_cast<uint8_t>(p[0]) == 0xE2 && static_cast<uint8_t>(p[1]) == 0x80 &&
++          static_cast<uint8_t>(p[2]) == 0x89)) {
++    if (*p == ' ') {
++      p++;
++      continue;
++    }
++    if (static_cast<uint8_t>(*p) == 0xE2) {
++      p += 3;
++      continue;
++    }
++    v = v * 10 + (*p - '0');
++    p++;
++    digits++;
++  }
++  if (*p == '.') {
++    p++;
++    double f = 0.1;
++    while (*p >= '0' && *p <= '9') {
++      v += (*p - '0') * f;
++      f *= 0.1;
++      p++;
++      digits++;
++    }
++  }
++  if (digits == 0) {
++    return false;
++  }
++  if ((static_cast<uint8_t>(p[0]) == 0xE1 &&
++       static_cast<uint8_t>(p[1]) == 0xB4 &&
++       static_cast<uint8_t>(p[2]) == 0x87) ||
++      *p == 'E' || *p == 'e') {
++    p += (*p == 'E' || *p == 'e') ? 1 : 3;
++    bool eneg = false;
++    if (*p == '-') {
++      eneg = true;
++      p++;
++    } else if (static_cast<uint8_t>(p[0]) == 0xE2) {
++      eneg = true;
++      p += 3;
++    }
++    int e = 0;
++    while (*p >= '0' && *p <= '9') {
++      e = e * 10 + (*p - '0');
++      p++;
++    }
++    for (int i = 0; i < e && i < 400; i++) {
++      v = eneg ? v / 10 : v * 10;
++    }
++  }
++  if (*p != 0) {
++    return false;
++  }
++  *value = neg ? -v : v;
++  return true;
++}
++
++/* ================================================================ items */
++
++const AppInfo* appInfo(I18n::Message name) {
++  for (const AppInfo& info : k_appInfos) {
++    if (info.name == name) {
++      return &info;
++    }
++  }
++  return nullptr;
++}
++
++bool isGame(int i) { return s_items[i].item.kind == Item::Kind::External; }
++
++const char* itemName(int i) {
++  if (isGame(i)) {
++    return AppsContainer::sharedAppsContainer()
++        ->externalAppAtIndex(s_items[i].item.index)
++        .name();
++  }
++  return I18n::translate(AppsContainer::sharedAppsContainer()
++                             ->appSnapshotAtIndex(PermutedAppSnapshotIndex(
++                                 s_items[i].item.index))
++                             ->descriptor()
++                             ->name());
++}
++
++void itemSymbol(int i, char* out) {
++  if (s_items[i].info) {
++    strlcpy(out, s_items[i].info->symbol, 8);
++    return;
++  }
++  const char* label = itemName(i);
++  int n = 0;
++  while (n < 3 && label[n] && static_cast<uint8_t>(label[n]) < 0x80) {
++    out[n] = label[n];
++    n++;
++  }
++  out[n] = 0;
++}
++
++KDColor itemColor(int i) {
++  if (isGame(i)) {
++    return rgb(0xE8463C);
++  }
++  if (s_items[i].hue < 0) {
++    return rgb(0x9AA0AE);
++  }
++  return hsv(s_items[i].hue, 190, 240);
++}
++
++void buildWorld() {
++  AppsContainer* container = AppsContainer::sharedAppsContainer();
++  int builtin = container->numberOfBuiltinApps();
++  s_numberOfItems = 0;
++  for (int appIndex = 1;
++       appIndex < builtin && s_numberOfItems < k_maxBuiltin; appIndex++) {
++    I18n::Message name =
++        container->appSnapshotAtIndex(PermutedAppSnapshotIndex(appIndex))
++            ->descriptor()
++            ->name();
++    ItemSlot& it = s_items[s_numberOfItems++];
++    it.item = {Item::Kind::Builtin, static_cast<int16_t>(appIndex)};
++    it.info = appInfo(name);
++    it.hue = it.info ? it.info->hue : (s_numberOfItems * 47) % 360;
++  }
++  s_numberOfBuiltin = s_numberOfItems;
++  int games = container->numberOfExternalApps();
++  for (int i = 0; i < games && i < k_maxGames; i++) {
++    ItemSlot& it = s_items[s_numberOfItems++];
++    it.item = {Item::Kind::External, static_cast<int16_t>(i)};
++    it.info = nullptr;
++    it.hue = 0;
++  }
++  /* The apps float along the terrarium, the games wait in the toy chest at
++   * the end, after a gap. */
++  constexpr float k_start = 150.f, k_spacing = 76.f;
++  float x = k_start;
++  s_numberOfPlatforms = 0;
++  for (int i = 0; i < s_numberOfItems; i++) {
++    if (i == s_numberOfBuiltin && i > 0) {
++      x += 70.f;
++    }
++    s_items[i].x = x;
++    s_items[i].y = (i % 2 == 0) ? 150.f : 112.f;
++    if (i % 3 == 1 && s_numberOfPlatforms < k_maxPlatforms) {
++      s_platforms[s_numberOfPlatforms++] = {
++          static_cast<int16_t>(x + k_spacing * 0.5f - 30), 168, 60};
++    }
++    x += k_spacing;
++  }
++  s.worldWidth = x + 90.f;
++  if (s.worldWidth < 2 * k_screenWidth) {
++    s.worldWidth = 2 * k_screenWidth;
++  }
++  if (s.goneItem >= s_numberOfItems) {
++    s.goneItem = -1;
++  }
++}
++
++float itemBob(int i) { return 4.f * sinf(s.now * 0.0025f + i * 1.3f); }
++
++/* ============================================================= speaking */
++
++void showMessage(const Message& m) {
++  s.message = m;
++  s.messageStart = s.now;
++}
++
++void say(const char* text, Face face = Face::Happy, int duration = 3200) {
++  Message m;
++  strlcpy(m.text, text, sizeof(m.text));
++  m.face = face;
++  m.duration = duration;
++  showMessage(m);
++  s.queueLength = 0;
++}
++
++void queue(const char* text, Face face = Face::Happy, int duration = 3200) {
++  if (s.message.text[0] == 0) {
++    say(text, face, duration);
++    return;
++  }
++  if (s.queueLength < count(s.queue)) {
++    Message& m = s.queue[s.queueLength++];
++    strlcpy(m.text, text, sizeof(m.text));
++    m.face = face;
++    m.duration = duration;
++  }
++}
++
++void updateMessages() {
++  if (s.message.text[0] && s.now - s.messageStart > s.message.duration) {
++    s.message.text[0] = 0;
++    if (s.queueLength > 0) {
++      showMessage(s.queue[0]);
++      for (int i = 1; i < s.queueLength; i++) {
++        s.queue[i - 1] = s.queue[i];
++      }
++      s.queueLength--;
++    }
++  }
++}
++
++void setFace(Face f, int ms) {
++  s.faceOverride = f;
++  s.faceUntil = s.now + ms;
++}
++
++/* ============================================================ particles */
++
++void spawn(PKind kind, float x, float y, float vx, float vy, int life,
++           KDColor color, int size = 2) {
++  // Reuse the particle closest to its end
++  int best = 0;
++  uint16_t bestLife = 0xFFFF;
++  for (int i = 0; i < k_maxParticles; i++) {
++    if (s.particles[i].life == 0) {
++      best = i;
++      break;
++    }
++    if (s.particles[i].life < bestLife) {
++      bestLife = s.particles[i].life;
++      best = i;
++    }
++  }
++  Particle& p = s.particles[best];
++  p = {x, y, vx, vy, static_cast<uint16_t>(life), static_cast<uint16_t>(life),
++       kind, static_cast<uint8_t>(size), static_cast<uint16_t>(color)};
++}
++
++void confetti(float x, float y, int n) {
++  for (int i = 0; i < n; i++) {
++    float a = frnd() * 2 * k_pi;
++    float v = 60 + frnd() * 200;
++    spawn(PKind::Confetti, x, y, cosf(a) * v, sinf(a) * v - 120,
++          900 + rnd() % 700, hsv(rnd() % 360, 200, 255), 2 + rnd() % 2);
++  }
++}
++
++void sparkles(float x, float y, int n, KDColor c) {
++  for (int i = 0; i < n; i++) {
++    float a = frnd() * 2 * k_pi;
++    float v = 30 + frnd() * 90;
++    spawn(PKind::Spark, x, y, cosf(a) * v, sinf(a) * v, 500 + rnd() % 400, c,
++          2 + rnd() % 2);
++  }
++}
++
++void crumbs(float x, float y, int n, KDColor c) {
++  for (int i = 0; i < n; i++) {
++    spawn(PKind::Crumb, x, y, (frnd() - 0.5f) * 160, -60 - frnd() * 120,
++          700, c, 2);
++  }
++}
++
++void dust(float x, float y, int n) {
++  for (int i = 0; i < n; i++) {
++    float dir = (i % 2) ? 1.f : -1.f;
++    spawn(PKind::Dust, x, y, dir * (40 + frnd() * 80), -10 - frnd() * 30,
++          450, rgb(0xFFFFFF), 3 + rnd() % 3);
++  }
++}
++
++/* ========================================================== the creature */
++
++const BiomeInfo& biome() { return k_biomes[static_cast<int>(s.biome)]; }
++
++int stageFor(int xp) {
++  int st = 0;
++  for (int i = 0; i < k_numberOfStages; i++) {
++    if (xp >= k_stageXp[i]) {
++      st = i;
++    }
++  }
++  return st;
++}
++
++KDColor baseColor() {
++  if (s.now < s.evilUntil) {
++    return rgb(0xD3243A);
++  }
++  if (s.now < s.sickUntil) {
++    return rgb(0xA8B83A);
++  }
++  if (s.biome == Biome::Disco) {
++    return hsv((s.now / 12) % 360, 170, 250);
++  }
++  if (s.now < s.danceUntil) {
++    return hsv((s.now / 8) % 360, 160, 250);
++  }
++  KDColor c = rgb(0x67DD5C);
++  if (s.stage == 3) {
++    // The supreme glutton shimmers
++    c = mix(c, rgb(0x46E0B4), static_cast<int>(128 + 120 * sinf(s.now * 0.002f)));
++  }
++  if (s.now < s.tintUntil) {
++    int left = static_cast<int>(s.tintUntil - s.now);
++    int t = left > 2000 ? 200 : left / 10;
++    c = mix(c, KDColor::RGB16(s.tint), t);
++  }
++  if (s.tanned) {
++    c = mix(c, rgb(0xA0662E), 130);
++  }
++  if (s.hunger > 75) {
++    c = mix(c, rgb(0x8C9A8A), static_cast<int>((s.hunger - 75) * 4));
++  }
++  return c;
++}
++
++Face currentFace() {
++  if (s.eat == EatPhase::Chew) {
++    return Face::Chew;
++  }
++  if (s.eat == EatPhase::TongueOut || s.eat == EatPhase::TongueBack ||
++      s.eat == EatPhase::Fly || s.eat == EatPhase::Burp) {
++    return Face::Wow;
++  }
++  if (s.now < s.faceUntil) {
++    return s.faceOverride;
++  }
++  if (s.sleeping) {
++    return Face::Sleep;
++  }
++  if (s.now < s.evilUntil) {
++    return Face::Evil;
++  }
++  if (s.now < s.angryUntil) {
++    return Face::Angry;
++  }
++  if (s.now < s.sickUntil) {
++    return Face::Sick;
++  }
++  if (s.now < s.partyUntil || s.now < s.danceUntil) {
++    return Face::Joy;
++  }
++  if (s.message.text[0] && s.message.face != Face::Happy) {
++    return s.message.face;
++  }
++  if (s.hunger > 75) {
++    return Face::Hungry;
++  }
++  return Face::Happy;
++}
++
++void mouth(float* x, float* y) {
++  *x = s.blob.x() + s.facing * s.blob.halfWidth() * 0.18f;
++  *y = s.blob.y() + s.blob.halfHeight() * 0.28f;
++}
++
++Env environment() {
++  const BiomeInfo& bi = biome();
++  Env e;
++  float g = bi.gravity;
++  if (s.ghost) {
++    g *= 0.12f;
++  }
++  e.gravity = s.flipped ? -g : g;
++  e.drag = s.ghost ? 1.5f : bi.drag;
++  e.jumpHeight = bi.jump;
++  e.floorY = k_floorY;
++  e.ceilY = k_ceilY;
++  e.left = 4;
++  e.right = s.worldWidth - 4;
++  e.bounce = bi.bounce;
++  e.platforms = s_platforms;
++  e.numberOfPlatforms = s_numberOfPlatforms;
++  return e;
++}
++
++void shake(float amp, int ms) {
++  s.shakeAmp = amp;
++  s.shakeUntil = s.now + ms;
++}
++
++/* ================================================== LED and backlight */
++
++int heartbeat() {
++  // Two beats per second-ish: lub-dub
++  uint32_t period = s.hunger > 75 || s.now < s.angryUntil ? 600 : 1100;
++  uint32_t t = s.now % period;
++  float k = 0;
++  if (t < 120) {
++    k = 1.f - t / 120.f;
++  } else if (t >= 220 && t < 340) {
++    k = 0.7f * (1.f - (t - 220) / 120.f);
++  }
++  return static_cast<int>(k * 255);
++}
++
++void setLed(KDColor c) {
++  if (!s.ledSet || static_cast<uint16_t>(c) != s.ledLast) {
++    Ion::LED::setColor(c);
++    s.ledLast = static_cast<uint16_t>(c);
++    s.ledSet = true;
++  }
++}
++
++void restoreLed() {
++  if (s.ledSet) {
++    Ion::LED::updateColorWithPlugAndCharge();
++    s.ledSet = false;
++  }
++}
++
++void updateLed() {
++  if (!s.ledOn || examMode() || !s_attached) {
++    restoreLed();
++    return;
++  }
++  KDColor c;
++  int k;
++  if (s.mode == Mode::Boot && s.now - s.modeStart < 3600) {
++    c = rgb(0xFFF2D0);
++    k = heartbeat() * (s.now - s.modeStart) / 3600;
++  } else if (s.sleeping) {
++    c = baseColor();
++    k = static_cast<int>(25 + 25 * sinf(s.now * 0.0015f));
++  } else if (s.now < s.angryUntil || s.now < s.evilUntil) {
++    c = rgb(0xFF0000);
++    k = (s.now / 120) % 2 ? 255 : 30;
++  } else if (s.biome == Biome::Disco || s.now < s.danceUntil ||
++             s.now < s.evolveStart + 2200) {
++    c = hsv((s.now / 4) % 360, 255, 255);
++    k = 200;
++  } else if (s.now < s.flashUntil) {
++    c = rgb(0xFFFFFF);
++    k = 255;
++  } else if (s.ghost) {
++    c = rgb(0xBFD8FF);
++    k = 20;
++  } else {
++    c = baseColor();
++    k = 25 + heartbeat() * 3 / 5;
++  }
++  setLed(KDColor::RGB888(c.red() * k / 255, c.green() * k / 255,
++                         c.blue() * k / 255));
++}
++
++void updateBacklight() {
++  int target = s.userBrightness;
++  if (s.lightOn && !examMode()) {
++    if (s.sleeping) {
++      target = s.userBrightness / 3;
++      if (target < 12) {
++        target = 12;
++      }
++    }
++    if (s.now < s.flashUntil) {
++      target = Ion::Backlight::MaxBrightness;
++    }
++  }
++  if (target != s.brightness) {
++    s.brightness = target;
++    if (!s_fake) {
++      Ion::Backlight::setBrightness(target);
++    }
++  }
++}
++
++void flash(int ms) { s.flashUntil = s.now + ms; }
++
++}  // namespace
++
++namespace {
++
++/* ================================================================ meals */
++
++void gainXp(int n) {
++  s.xp += n;
++  int st = stageFor(s.xp);
++  if (st > s.stage) {
++    s.stage = st;
++    s.evolveStart = s.now;
++    s.blob.setRadius(k_stageRadius[st]);
++    flash(160);
++    shake(4, 500);
++    confetti(s.blob.x(), s.blob.y(), 40);
++    if (st >= 2 && !s.discoUnlocked) {
++      s.discoUnlocked = true;
++    }
++  }
++}
++
++void eaten() {
++  if (s.numberOfBites > 0) {
++    // Feeding heals the screen it nibbled
++    s.numberOfBites--;
++  }
++  s.hunger -= s.meal == Meal::Pellet ? 24.f : 12.f;
++  if (s.hunger < 0) {
++    s.hunger = 0;
++  }
++}
++
++void startPop() {
++  s.popping = true;
++  s.popStart = s.now;
++  s.inflation = 1.f;
++  s.blob.setInflation(1.f);
++  KDColor c = baseColor();
++  for (int i = 0; i < 18; i++) {
++    float a = 2 * k_pi * i / 18 + frnd() * 0.3f;
++    float v = 160 + frnd() * 160;
++    spawn(PKind::Drop, s.blob.x(), s.blob.y(), cosf(a) * v,
++          sinf(a) * v - 80, 1500, c, 4 + rnd() % 4);
++  }
++  confetti(s.blob.x(), s.blob.y(), 16);
++  shake(7, 600);
++  flash(140);
++  say("*POP*", Face::Dizzy, 1500);
++}
++
++/* What GLOUTON thinks of the result you fed it */
++void react(const Pellet& p) {
++  char line[100];
++  Str m(line, sizeof(line));
++  double v = 0;
++  bool number = parseNumber(p.output, &v);
++  s.numbersEaten++;
++  s.weight += 3 * static_cast<int>(strlen(p.output)) + 2;
++  strlcpy(s.lastMeal, p.output, sizeof(s.lastMeal));
++  gainXp(1);
++  KDColor here = rgb(0xFFE08A);
++  float x = s.blob.x(), y = s.blob.y();
++  bool nonNumber = !number;
++  if (nonNumber && (contains(p.output, "undef") || contains(p.output, "nonreal"))) {
++    s.sickUntil = s.now + 12000;
++    for (int i = 0; i < 10; i++) {
++      spawn(PKind::Bubble, x + (frnd() - 0.5f) * 30, y, (frnd() - 0.5f) * 20,
++            -30 - frnd() * 30, 1400, rgb(0x9BD34A), 3 + rnd() % 3);
++    }
++    say("BEURK ! Du \"undef\"...\nJ'ai mal au ventre.",
++        Face::Sick, 4000);
++    return;
++  }
++  if (nonNumber && contains(p.output, "inf")) {
++    s.inflation = 1.95f;
++    s.blob.setInflation(s.inflation);
++    s.hugeUntil = s.now + 900;
++    say("L'INFINI ?!\nC'est trop pour moi !!!", Face::Wow, 2000);
++    return;
++  }
++  if (nonNumber) {
++    say("C'est quoi ce truc ?!\n\xC3\x87""a croustille bizarre.", Face::Dizzy,
++        3500);
++    crumbs(x, y, 10, here);
++    return;
++  }
++  if (strcmp(p.input, "1+1") == 0) {
++    say("Tu avais VRAIMENT besoin\nde moi pour 1+1 ?", Face::Angry, 4000);
++    return;
++  }
++  double a = v < 0 ? -v : v;
++  bool integer = a < 1e15 && v == static_cast<double>(static_cast<long long>(v));
++  long long iv = integer ? static_cast<long long>(v) : 0;
++  if (integer && iv == 42) {
++    sparkles(x, y, 20, rgb(0xFFF07A));
++    say("42 ! La r\xC3\xA9ponse \xC3\xA0 tout.\nJe me sens sage.", Face::Love,
++        4000);
++  } else if (fabs(v - 3.14159265) < 2e-5) {
++    s.partyUntil = s.now + 5000;
++    confetti(x, y, 40);
++    say("DU \xCF\x80 !!! MON PLAT\nPR\xC3\x89""F\xC3\x89R\xC3\x89 !!!",
++        Face::Love, 4000);
++  } else if (integer && iv == 666) {
++    s.evilUntil = s.now + 9000;
++    shake(3, 900);
++    say("666... je me sens\nbizarre. H\xC3\x89H\xC3\x89H\xC3\x89.", Face::Evil,
++        4500);
++  } else if (integer && iv == 69) {
++    say("Nice.", Face::Joy, 2500);
++  } else if (integer && iv == 1337) {
++    s.tanned = true;
++    s.costume = 4;
++    say("1337 ! Je suis un\nhacker maintenant.", Face::Joy, 4000);
++  } else if (integer && iv == 404) {
++    say("404 : nombre introuvable.\nAh si, je l'ai mang\xC3\xA9.", Face::Joy,
++        4000);
++  } else if (integer && iv == 0) {
++    say("Z\xC3\xA9ro. C'est vide.\nJ'ai encore faim.", Face::Hungry, 3500);
++  } else if (integer && iv == 7) {
++    sparkles(x, y, 12, rgb(0x7AF0FF));
++    say("7 ! Mon chiffre\nporte-bonheur.", Face::Love, 3500);
++  } else if (integer && iv == 1) {
++    say("Un. Tout seul.\nComme moi avant toi.", Face::Happy, 3500);
++  } else if (a >= 1e9) {
++    s.inflation = 1.45f;
++    s.blob.setInflation(s.inflation);
++    s.hugeUntil = s.now + 6000;
++    s.weight += 500;
++    say("\xC3\x89NORME ! +500 g.\nJe vais exploser... *burp*", Face::Wow,
++        4000);
++  } else if (v < 0) {
++    setFace(Face::Angry, 1500);
++    s.blob.jiggle(120, rnd());
++    m.add(p.text).add(" ? N\xC3\xA9gatif...\n\xC3\x87""a pique, c'est acide !");
++    say(line, Face::Angry, 3500);
++  } else if (integer && iv >= 2 && iv < 100000000) {
++    bool prime = true;
++    for (long long d = 2; d * d <= iv; d++) {
++      if (iv % d == 0) {
++        prime = false;
++        break;
++      }
++    }
++    if (prime) {
++      m.add(p.text).add(" est premier !\nCroquant comme tout.");
++      sparkles(x, y, 10, rgb(0xB0FF7A));
++    } else {
++      m.add("Miam, un ").add(p.text).add(" !\nBien rond, bien bon.");
++    }
++    say(line, Face::Joy, 3500);
++  } else {
++    m.add(p.text).add("... plein de\nvirgules, \xC3\xA7""a colle aux dents.");
++    say(line, Face::Happy, 3500);
++  }
++  crumbs(x, y, 8, here);
++}
++
++void spawnPellet(const char* input, const char* output, float x) {
++  Pellet* slot = nullptr;
++  for (Pellet& p : s.pellets) {
++    if (!p.active) {
++      slot = &p;
++      break;
++    }
++  }
++  if (!slot) {
++    slot = &s.pellets[rnd() % k_maxPellets];
++  }
++  slot->active = true;
++  slot->x = x;
++  slot->y = s.flipped ? k_floorY + 10 : -10;
++  slot->vx = (frnd() - 0.5f) * 60;
++  slot->vy = 0;
++  strlcpy(slot->input, input, sizeof(slot->input));
++  strlcpy(slot->output, output, sizeof(slot->output));
++  // The label: at most 9 characters (UTF-8 aware)
++  int n = 0, chars = 0;
++  while (output[n] && chars < 9) {
++    n++;
++    while ((static_cast<uint8_t>(output[n]) & 0xC0) == 0x80) {
++      n++;
++    }
++    chars++;
++  }
++  int len = n < static_cast<int>(sizeof(slot->text)) - 4 ? n : 0;
++  memcpy(slot->text, output, len);
++  slot->text[len] = 0;
++  if (output[n]) {
++    strlcpy(slot->text + len, "..", sizeof(slot->text) - len);
++  }
++}
++
++// Results of the Calculation app that GLOUTON has not eaten yet rain down
++int collectFood() {
++  uint32_t produced = Food::produced();
++  int n = 0;
++  if (s.foodSeen + k_maxPellets < produced) {
++    s.foodSeen = produced - k_maxPellets;
++  }
++  while (s.foodSeen < produced) {
++    const Food::Entry* e = Food::at(s.foodSeen);
++    s.foodSeen++;
++    if (e) {
++      // The first one falls right on GLOUTON, the others around
++      float x = n == 0 ? s.blob.x() : s.blob.x() + (n % 2 ? 1 : -1) * (24 + 22 * n);
++      if (x < 20) {
++        x = 20 + 25 * n;
++      }
++      if (x > s.worldWidth - 20) {
++        x = s.worldWidth - 20 - 25 * n;
++      }
++      spawnPellet(e->input, e->output, x);
++      n++;
++    }
++  }
++  return n;
++}
++
++/* ============================================================== eating */
++
++void startEat(Meal meal, int index, float toX, float toY) {
++  s.meal = meal;
++  s.eatIndex = index;
++  s.eatToX = toX;
++  s.eatToY = toY;
++  s.eat = EatPhase::TongueOut;
++  s.eatStart = s.now;
++  s.sleeping = false;
++}
++
++void tongue() {
++  if (s.eat != EatPhase::None || s.popping) {
++    return;
++  }
++  float mx, my;
++  mouth(&mx, &my);
++  if (s.targetKind == 1) {
++    int i = s.targetIndex;
++    startEat(Meal::Item, i, s_items[i].x, s_items[i].y + itemBob(i));
++  } else if (s.targetKind == 2) {
++    Pellet& p = s.pellets[s.targetIndex];
++    startEat(Meal::Pellet, s.targetIndex, p.x, p.y);
++  } else {
++    startEat(Meal::Nothing, 0, mx + s.facing * 110, my - 20);
++  }
++}
++
++void eatFromFridge(int i) {
++  s.mode = Mode::World;
++  s.meal = Meal::Item;
++  s.eatIndex = i;
++  s.eat = EatPhase::Fly;
++  s.eatStart = s.now;
++  s.eatFromX = s.camX + 160;
++  s.eatFromY = -20;
++  s.sleeping = false;
++}
++
++void digest();
++
++void updateEating() {
++  uint32_t t = s.now - s.eatStart;
++  switch (s.eat) {
++    case EatPhase::None:
++      return;
++    case EatPhase::TongueOut:
++      if (s.meal == Meal::Pellet) {
++        // The pellet may still be falling: follow it
++        Pellet& p = s.pellets[s.eatIndex];
++        if (p.active) {
++          s.eatToX = p.x;
++          s.eatToY = p.y;
++        }
++      }
++      if (t >= 130) {
++        s.eat = EatPhase::TongueBack;
++        s.eatStart = s.now;
++        if (s.meal == Meal::Pellet) {
++          Pellet& p = s.pellets[s.eatIndex];
++          s.eaten = p;
++          p.active = false;
++          if (!s.eaten.active) {
++            s.meal = Meal::Nothing;
++          }
++        } else if (s.meal == Meal::Item) {
++          s.goneItem = s.eatIndex;
++        }
++      }
++      return;
++    case EatPhase::TongueBack:
++    case EatPhase::Fly:
++      if (t >= (s.eat == EatPhase::Fly ? 380u : 170u)) {
++        if (s.meal == Meal::Nothing) {
++          s.eat = EatPhase::None;
++          if (rnd() % 2) {
++            say("Rien \xC3\xA0 manger par l\xC3\xA0...", Face::Hungry, 1800);
++          }
++          return;
++        }
++        if (s.meal == Meal::Item) {
++          s.goneItem = s.eatIndex;
++        }
++        s.eat = EatPhase::Chew;
++        s.eatStart = s.now;
++        s.blob.squeeze(3.f);
++      }
++      return;
++    case EatPhase::Chew: {
++      // Chomp chomp chomp
++      uint32_t before = (t - (s.now - s.last)) / 170;
++      if (t / 170 != before && t > 0) {
++        s.blob.squeeze((t / 170) % 2 ? 2.2f : -2.2f);
++        float mx, my;
++        mouth(&mx, &my);
++        crumbs(mx, my, 3,
++               s.meal == Meal::Item ? itemColor(s.eatIndex) : rgb(0xF4D9A0));
++      }
++      if (t >= 680) {
++        eaten();
++        if (s.meal == Meal::Pellet) {
++          s.eat = EatPhase::None;
++          react(s.eaten);
++        } else {
++          s.eat = EatPhase::Burp;
++          s.eatStart = s.now;
++          s.appsEaten++;
++          s.appMeals[s.eatIndex]++;
++          s.weight += 40;
++          s.tint = static_cast<uint16_t>(itemColor(s.eatIndex));
++          s.tintUntil = s.now + 9000;
++          gainXp(1);
++          s.blob.squeeze(-3.f);
++          say("BUUUURP !", Face::Joy, 900);
++        }
++      }
++      return;
++    }
++    case EatPhase::Burp:
++      if (t >= 420) {
++        s.eat = EatPhase::None;
++        digest();
++      }
++      return;
++  }
++}
++
++/* ================================================================ minis */
++
++void updateMinis(float dt, const Env& env) {
++  float down = env.gravity >= 0 ? 1.f : -1.f;
++  float g = fabsf(env.gravity);
++  for (int i = 0; i < s.numberOfMinis; i++) {
++    Mini& m = s.minis[i];
++    // They follow the big one, in a line
++    float tx = s.blob.x() - s.facing * (s.blob.halfWidth() + 14 + 18 * i);
++    m.vx += (tx - m.x) * 6.f * dt;
++    m.vx *= 1.f - 3.f * dt;
++    m.vy += down * g * dt;
++    m.x += m.vx * dt;
++    m.y += m.vy * dt;
++    float r = 7.f;
++    bool landed = false;
++    if (down > 0 && m.y > k_floorY - r) {
++      m.y = k_floorY - r;
++      landed = m.vy > 60;
++      m.vy = 0;
++    } else if (down < 0 && m.y < k_ceilY + r) {
++      m.y = k_ceilY + r;
++      landed = m.vy < -60;
++      m.vy = 0;
++    }
++    if (landed) {
++      m.squash = 0.45f;
++    }
++    bool onGround = (down > 0 && m.y >= k_floorY - r - 0.5f) ||
++                    (down < 0 && m.y <= k_ceilY + r + 0.5f);
++    // Hop with the big one, or for fun
++    if (onGround && ((!s.blob.grounded() && fabsf(m.x - s.blob.x()) < 120 &&
++                      (rnd() % 8) == 0) ||
++                     (rnd() % 160) == 0)) {
++      m.vy = -down * sqrtf(2 * g * (30 + 20 * frnd()));
++      m.squash = -0.35f;
++    }
++    m.squash += (0 - m.squash) * (10.f * dt > 1 ? 1 : 10.f * dt);
++    m.phase += dt;
++    if (m.x < 8) {
++      m.x = 8;
++    } else if (m.x > s.worldWidth - 8) {
++      m.x = s.worldWidth - 8;
++    }
++  }
++}
++
++/* =============================================================== world */
++
++void updateParticles(float dt) {
++  int ms = static_cast<int>(dt * 1000);
++  for (Particle& p : s.particles) {
++    if (p.life == 0) {
++      continue;
++    }
++    p.life = p.life > ms ? p.life - ms : 0;
++    switch (p.kind) {
++      case PKind::Confetti:
++      case PKind::Crumb:
++        p.vy += 420 * dt;
++        p.vx *= 1 - 1.5f * dt;
++        if (p.y > k_floorY && p.vy > 0) {
++          p.y = k_floorY;
++          p.vy *= -0.3f;
++          p.vx *= 0.5f;
++        }
++        break;
++      case PKind::Drop:
++        if (s.popping && s.now - s.popStart > 850) {
++          // Back together
++          p.vx += (s.blob.x() - p.x) * 30 * dt;
++          p.vy += (s.blob.y() - p.y) * 30 * dt;
++          p.vx *= 1 - 5 * dt;
++          p.vy *= 1 - 5 * dt;
++        } else {
++          p.vy += 600 * dt;
++          if (p.y > k_floorY - 2 && p.vy > 0) {
++            p.y = k_floorY - 2;
++            p.vy *= -0.35f;
++            p.vx *= 0.6f;
++          }
++        }
++        break;
++      case PKind::Zzz:
++      case PKind::Note:
++      case PKind::Bubble:
++      case PKind::Ember:
++      case PKind::Steam:
++        p.vx += sinf((s.now + p.maxLife * 7) * 0.006f) * 40 * dt;
++        break;
++      case PKind::Firefly:
++        p.vx += (frnd() - 0.5f) * 200 * dt;
++        p.vy += (frnd() - 0.5f) * 200 * dt;
++        p.vx *= 1 - dt;
++        p.vy *= 1 - dt;
++        break;
++      case PKind::Dust:
++        p.vx *= 1 - 4 * dt;
++        p.vy *= 1 - 4 * dt;
++        break;
++      default:
++        p.vx *= 1 - 2 * dt;
++        p.vy *= 1 - 2 * dt;
++        break;
++    }
++    p.x += p.vx * dt;
++    p.y += p.vy * dt;
++  }
++}
++
++void ambient(float dt) {
++  // Biome life
++  float chance = dt * 1000;
++  float left = s.camX, w = k_screenWidth;
++  switch (s.biome) {
++    case Biome::Night:
++      if (rnd() % 1000 < chance * 0.06f) {
++        spawn(PKind::Firefly, left + frnd() * w, 60 + frnd() * 130, 0, 0,
++              4000, rgb(0xE8FF7A), 2);
++      }
++      break;
++    case Biome::Volcano:
++      if (rnd() % 1000 < chance * 0.25f) {
++        spawn(PKind::Ember, left + frnd() * w, k_floorY,
++              (frnd() - 0.5f) * 20, -30 - frnd() * 60, 2500,
++              hsv(10 + rnd() % 35, 255, 255), 1 + rnd() % 2);
++      }
++      break;
++    case Biome::Aquarium:
++      if (rnd() % 1000 < chance * 0.12f) {
++        spawn(PKind::Bubble, left + frnd() * w, k_floorY, 0,
++              -25 - frnd() * 30, 6000, rgb(0xBFEFFF), 2 + rnd() % 3);
++      }
++      break;
++    case Biome::Disco:
++      if (rnd() % 1000 < chance * 0.08f) {
++        spawn(PKind::Spark, left + frnd() * w, 20 + frnd() * 150, 0, 8,
++              700, hsv(rnd() % 360, 200, 255), 2);
++      }
++      break;
++    default:
++      break;
++  }
++}
++
++void chooseTarget() {
++  s.targetKind = 0;
++  if (s.eat != EatPhase::None || s.popping) {
++    return;
++  }
++  float mx, my;
++  mouth(&mx, &my);
++  float best = k_tongueRange;
++  for (int i = 0; i < k_maxPellets; i++) {
++    const Pellet& p = s.pellets[i];
++    if (!p.active) {
++      continue;
++    }
++    float d = hypotf(p.x - mx, p.y - my) * 0.8f;  // food first
++    if (d < best) {
++      best = d;
++      s.targetKind = 2;
++      s.targetIndex = i;
++    }
++  }
++  for (int i = 0; i < s_numberOfItems; i++) {
++    if (i == s.goneItem) {
++      continue;
++    }
++    float dx = s_items[i].x - mx, dy = s_items[i].y - my;
++    float d = hypotf(dx, dy);
++    if (dx * s.facing < -8) {
++      d += 50;  // behind
++    }
++    if (d < best) {
++      best = d;
++      s.targetKind = 1;
++      s.targetIndex = i;
++    }
++  }
++}
++
++void updatePellets(float dt, const Env& env) {
++  float down = env.gravity >= 0 ? 1.f : -1.f;
++  for (int i = 0; i < k_maxPellets; i++) {
++    Pellet& p = s.pellets[i];
++    if (!p.active) {
++      continue;
++    }
++    if (s.eat == EatPhase::TongueOut && s.meal == Meal::Pellet &&
++        s.eatIndex == i) {
++      continue;
++    }
++    p.vy += down * fabsf(env.gravity) * 0.7f * dt;
++    p.x += p.vx * dt;
++    p.y += p.vy * dt;
++    if (down > 0 && p.y > k_floorY - 8) {
++      p.y = k_floorY - 8;
++      p.vy = p.vy > 80 ? -p.vy * 0.4f : 0;
++      p.vx *= 0.8f;
++    } else if (down < 0 && p.y < k_ceilY + 8) {
++      p.y = k_ceilY + 8;
++      p.vy = p.vy < -80 ? -p.vy * 0.4f : 0;
++      p.vx *= 0.8f;
++    }
++    if (p.x < 12) {
++      p.x = 12;
++      p.vx = -p.vx;
++    } else if (p.x > s.worldWidth - 12) {
++      p.x = s.worldWidth - 12;
++      p.vx = -p.vx;
++    }
++    // Touching GLOUTON: gulp
++    if (s.eat == EatPhase::None && !s.popping &&
++        fabsf(p.x - s.blob.x()) < s.blob.halfWidth() + 6 &&
++        fabsf(p.y - s.blob.y()) < s.blob.halfHeight() + 6) {
++      s.eaten = p;
++      p.active = false;
++      s.meal = Meal::Pellet;
++      s.eat = EatPhase::Chew;
++      s.eatStart = s.now;
++    }
++  }
++}
++
++void idleLife(Control* c) {
++  uint32_t idle = s.now - s.lastInput;
++  if (s.sleeping) {
++    if ((s.now / 900) != ((s.now - 40) / 900)) {
++      spawn(PKind::Zzz, s.blob.x() + s.blob.halfWidth() * 0.6f,
++            s.blob.top() - 4, 12, -22, 2400, rgb(0xFFFFFF), 1);
++    }
++    return;
++  }
++  if (idle > 35000 && s.eat == EatPhase::None && !s.popping &&
++      s.now > s.danceUntil && s.biome != Biome::Disco) {
++    s.sleeping = true;
++    say("Bon... je fais une\npetite sieste. zZz", Face::Sleep, 2500);
++    return;
++  }
++  if (s.biome == Biome::Disco && s.blob.grounded() && idle > 1500 &&
++      (s.now / 460) != ((s.now - 40) / 460)) {
++    // It cannot help dancing
++    c->jump = true;
++  }
++  if (idle > 9000 && s.now > s.nextIdle) {
++    s.nextIdle = s.now + 5000 + rnd() % 5000;
++    int what = rnd() % 4;
++    if (what == 0) {
++      c->jump = true;
++    } else if (what == 1 && s.targetKind == 1) {
++      const AppInfo* info = s_items[s.targetIndex].info;
++      say(info ? info->sniff : "Un jeu ! \xC3\x87""a sent\nle fun.",
++          Face::Happy, 3000);
++    } else if (what == 2) {
++      say(k_idleLines[rnd() % count(k_idleLines)], Face::Happy, 3500);
++    } else {
++      s.facing = -s.facing;
++      for (int i = 0; i < 3; i++) {
++        spawn(PKind::Note, s.blob.x(), s.blob.top(), (frnd() - 0.5f) * 40,
++              -40, 1500, rgb(0xFFFFFF), 1);
++      }
++    }
++  }
++  if (idle > 2000 && idle < 9000 && (rnd() % 400) == 0) {
++    // Looks the other way, now and then
++    s.facing = -s.facing;
++  }
++}
++
++void hungerLife(float dt) {
++  s.hunger += dt * (100.f / (18 * 60));  // empty to starving: 18 minutes
++  if (s.hunger > 100) {
++    s.hunger = 100;
++  }
++  if (s.hunger > 75 && s.now > s.nextHungry && !s.sleeping &&
++      s.mode == Mode::World && s.eat == EatPhase::None) {
++    s.nextHungry = s.now + 25000;
++    queue(k_hungryLines[rnd() % count(k_hungryLines)], Face::Hungry, 3500);
++    shake(2, 400);
++  }
++  if (s.hunger >= 95 && s.now > s.nextBite && s.numberOfBites < k_maxBites &&
++      s.mode == Mode::World) {
++    // So hungry it eats the screen
++    s.nextBite = s.now + 15000;
++    Bite& b = s.bites[s.numberOfBites++];
++    int side = rnd() % 4;
++    b.r = 14 + rnd() % 16;
++    if (side == 0) {
++      b.x = rnd() % k_screenWidth;
++      b.y = 0;
++    } else if (side == 1) {
++      b.x = rnd() % k_screenWidth;
++      b.y = k_screenHeight;
++    } else {
++      b.x = side == 2 ? 0 : k_screenWidth;
++      b.y = 30 + rnd() % 180;
++    }
++    say("J'ai tellement faim que\nje mange ton \xC3\xA9""cran.", Face::Hungry,
++        4000);
++    shake(3, 300);
++  }
++}
++
++void updateWorld(float dt, const Ion::Keyboard::State& keys) {
++  Control c = {0, false, false, false};
++  bool busy = s.eat == EatPhase::TongueOut || s.eat == EatPhase::TongueBack ||
++              s.eat == EatPhase::Burp || s.popping;
++  if (!busy && !s.sleeping && s.mode == Mode::World) {
++    if (keys.keyDown(Key::Left)) {
++      c.move = -1;
++    } else if (keys.keyDown(Key::Right)) {
++      c.move = 1;
++    }
++    c.jumpHeld = keys.keyDown(Key::Up) || keys.keyDown(Key::EXE);
++  }
++  c.jump = s.jumpRequest && !busy;
++  c.slam = s.slamRequest && !busy;
++  s.jumpRequest = s.slamRequest = false;
++  if (c.move != 0) {
++    s.facing = c.move > 0 ? 1 : -1;
++    s.lastInput = s.now;
++  }
++  if (s.now < s.danceUntil && !busy) {
++    float t = (s.danceUntil - s.now) * 0.004f;
++    c.move = sinf(t * 2.f) * 0.9f;
++    c.jumpHeld = true;
++    if (s.blob.grounded() && (rnd() % 5) == 0) {
++      c.jump = true;
++    }
++    if ((rnd() % 6) == 0) {
++      spawn(PKind::Note, s.blob.x(), s.blob.top(), (frnd() - 0.5f) * 60,
++            -50, 1300, hsv(rnd() % 360, 160, 255), 1);
++    }
++  }
++  idleLife(&c);
++  Env env = environment();
++  // Volcano: the floor burns
++  if (s.biome == Biome::Volcano && s.blob.grounded() &&
++      s.blob.bottom() > k_floorY - 1 && !s.flipped) {
++    if (s.hotSince == 0) {
++      s.hotSince = s.now;
++    } else if (s.now - s.hotSince > 1400) {
++      s.hotSince = 0;
++      c.jump = true;
++      c.jumpHeld = true;
++      for (int i = 0; i < 4; i++) {
++        spawn(PKind::Steam, s.blob.x() + (frnd() - 0.5f) * 20,
++              s.blob.bottom(), 0, -40, 900, rgb(0xFFFFFF), 4);
++      }
++      if ((rnd() % 3) == 0) {
++        say("A\xC3\x8F""E ! \xC3\x87""a br\xC3\xBBle !", Face::Wow, 1200);
++      }
++    }
++  } else {
++    s.hotSince = 0;
++  }
++  // Inflation relaxes by itself
++  if (s.now > s.hugeUntil && s.inflation > 1.f && !s.popping) {
++    s.inflation += (1.f - s.inflation) * (dt * 0.25f);
++    s.blob.setInflation(s.inflation);
++  }
++  if (s.hugeUntil && s.now > s.hugeUntil && s.inflation > 1.85f) {
++    s.hugeUntil = 0;
++    startPop();
++  }
++  if (s.popping) {
++    if (s.now - s.popStart > 1350) {
++      s.popping = false;
++      s.blob.init(s.blob.x(), s.blob.y(), k_stageRadius[s.stage] * 0.3f);
++      s.blob.setRadius(k_stageRadius[s.stage]);
++      s.blob.impulse(0, -150);
++      for (Particle& p : s.particles) {
++        if (p.kind == PKind::Drop) {
++          p.life = 0;
++        }
++      }
++      say("...PLOP ! Je suis\nrevenu. C'\xC3\xA9tait g\xC3\xA9nial.", Face::Joy,
++          3000);
++    }
++  } else {
++    s.blob.step(dt, env, c);
++  }
++  float impact = s.blob.takeImpact();
++  if (impact > 380) {
++    shake(impact / 120, 250);
++    dust(s.blob.x(), s.flipped ? s.blob.top() : s.blob.bottom(), 8);
++    if (impact > 650 && (rnd() % 2) == 0) {
++      say("OUF !", Face::Dizzy, 900);
++    }
++  }
++  updateMinis(dt, env);
++  updatePellets(dt, env);
++  chooseTarget();
++  updateEating();
++  ambient(dt);
++  // Camera: a bit ahead of where it looks
++  s.camTarget = s.blob.x() - k_screenWidth / 2 + s.facing * 30;
++  float maxCam = s.worldWidth - k_screenWidth;
++  s.camTarget = s.camTarget < 0 ? 0 : (s.camTarget > maxCam ? maxCam : s.camTarget);
++  s.camX += (s.camTarget - s.camX) * (dt * 5 > 1 ? 1 : dt * 5);
++}
++
++void setBiome(Biome b, bool talk) {
++  s.biome = b;
++  if (talk) {
++    say(biome().line, b == Biome::Disco ? Face::Joy : Face::Wow, 3000);
++    confetti(s.blob.x(), s.blob.y(), 12);
++  }
++  for (Particle& p : s.particles) {
++    if (p.kind == PKind::Firefly || p.kind == PKind::Ember ||
++        p.kind == PKind::Bubble) {
++      p.life = 0;
++    }
++  }
++}
++
++void startWorld() {
++  s.mode = Mode::World;
++  s.modeStart = s.now;
++  s.lastInput = s.now;
++  if (!s.introDone) {
++    s.introDone = true;
++    s.message.text[0] = 0;
++    for (const char* line : k_intro) {
++      queue(line, Face::Joy, 3600);
++    }
++  }
++}
++
++}  // namespace
++
++namespace {
++
++/* ============================================================ rendering */
++
++int s_shakeX = 0, s_shakeY = 0;
++float camX() { return floorf(s.camX) - s_shakeX; }
++float camY() { return static_cast<float>(-s_shakeY); }
++
++float wave(float x, float a, float f, float p) { return a * sinf(x * f + p); }
++
++void prepareBackground() {
++  const BiomeInfo& bi = biome();
++  KDColor top = rgb(bi.skyTop), bottom = rgb(bi.skyBottom);
++  for (int y = 0; y < k_screenHeight; y++) {
++    int t = y * 256 / static_cast<int>(k_floorY);
++    s_sky[y] = mix(top, bottom, t > 256 ? 256 : t);
++  }
++  float cx = camX();
++  for (int x = 0; x < k_screenWidth; x++) {
++    float far = cx * 0.3f + x, nearX = cx * 0.6f + x;
++    int f = 999, n = 999;
++    switch (s.biome) {
++      case Biome::Garden:
++      case Biome::Night:
++        f = static_cast<int>(150 + wave(far, 16, 0.011f, 0) +
++                             wave(far, 8, 0.029f, 2));
++        n = static_cast<int>(182 + wave(nearX, 10, 0.019f, 1) +
++                             wave(nearX, 5, 0.047f, 3));
++        break;
++      case Biome::Volcano: {
++        float d = fabsf(fmodf(far + 4000, 280) - 140);
++        float h = 105 - d * 0.95f;
++        h = h < 0 ? 0 : (h > 88 ? 88 - (h - 88) * 0.6f : h);
++        f = static_cast<int>(200 - h);
++        n = static_cast<int>(194 + wave(nearX, 6, 0.05f, 0) +
++                             wave(nearX, 4, 0.13f, 1));
++        break;
++      }
++      case Biome::Aquarium:
++        f = static_cast<int>(186 + wave(far, 9, 0.016f, 0));
++        break;
++      default:
++        break;
++    }
++    s_far[x] = f;
++    s_near[x] = n;
++  }
++}
++
++void drawStars(Band& b, int numberOfStars, float parallax, bool twinkle) {
++  float cx = camX() * parallax;
++  for (int i = 0; i < numberOfStars; i++) {
++    uint32_t h = hash(i * 7919 + 13);
++    int x = static_cast<int>((h % 1280) - cx) % 1280;
++    x = x < 0 ? x + 1280 : x;
++    if (x >= k_screenWidth) {
++      continue;
++    }
++    int y = (h >> 11) % 190;
++    if (y < b.clip().y - 1 || y > b.clip().bottom()) {
++      continue;
++    }
++    int a = 255;
++    if (twinkle) {
++      a = 120 + static_cast<int>(135 * sinf(s.now * 0.003f + (h & 0xFF)));
++    }
++    KDColor c = (h >> 20) % 5 == 0 ? rgb(0xFFE7B0) : rgb(0xFFFFFF);
++    fill(b, {x, y, 1, 1}, c, a);
++    if ((h >> 24) % 7 == 0) {
++      fill(b, {x - 1, y, 3, 1}, c, a / 3);
++      fill(b, {x, y - 1, 1, 3}, c, a / 3);
++    }
++  }
++}
++
++void drawSky(Band& b) {
++  const BiomeInfo& bi = biome();
++  const Rect& clip = b.clip();
++  KDColor far = rgb(bi.far), nearC = rgb(bi.nearLayer);
++  for (int y = clip.y; y < clip.bottom() && y < k_floorY; y++) {
++    KDColor* row = b.row(y);
++    KDColor sky = s_sky[y];
++    KDColor farShade = mix(far, s_sky[y], 40);
++    for (int x = clip.x; x < clip.right(); x++) {
++      if (y >= s_near[x]) {
++        row[x] = mix(nearC, rgb(0x000000), (y - s_near[x]) * 2);
++      } else if (y >= s_far[x]) {
++        row[x] = farShade;
++      } else {
++        row[x] = sky;
++      }
++    }
++  }
++  float cx = camX();
++  switch (s.biome) {
++    case Biome::Garden: {
++      ellipse(b, 262 - cx * 0.05f, 46, 22, 22, rgb(0xFFF4B0), 120);
++      ellipse(b, 262 - cx * 0.05f, 46, 16, 16, rgb(0xFFE45C));
++      for (int i = 0; i < 5; i++) {
++        float x = fmodf(i * 211.f - cx * 0.15f + s.now * 0.004f + 2000.f,
++                        700.f) - 80;
++        float y = 30 + (i * 37) % 70;
++        ellipse(b, x, y, 26, 9, rgb(0xFFFFFF), 220);
++        ellipse(b, x - 12, y - 5, 12, 9, rgb(0xFFFFFF), 220);
++        ellipse(b, x + 10, y - 7, 14, 10, rgb(0xFFFFFF), 220);
++      }
++      break;
++    }
++    case Biome::Night:
++      drawStars(b, 90, 0.1f, true);
++      ellipse(b, 70 - cx * 0.04f, 44, 24, 24, rgb(0xFFF6D8), 50);
++      ellipse(b, 70 - cx * 0.04f, 44, 15, 15, rgb(0xFFF6D8));
++      ellipse(b, 65 - cx * 0.04f, 40, 4, 4, rgb(0xE3DCC0));
++      ellipse(b, 75 - cx * 0.04f, 50, 3, 3, rgb(0xE3DCC0));
++      break;
++    case Biome::Volcano: {
++      // Glowing craters and their smoke
++      for (int k = -1; k < 4; k++) {
++        float base = floorf((cx * 0.3f) / 280.f) * 280.f + k * 280.f + 140.f;
++        float x = base - cx * 0.3f;
++        ellipse(b, x, 118, 30, 14, rgb(0xFF8A2E), 70);
++        ellipse(b, x, 116, 14, 5, rgb(0xFFD25C), 200);
++        for (int j = 0; j < 3; j++) {
++          float t = fmodf(s.now * 0.02f + j * 33.f, 100.f);
++          ellipse(b, x + sinf(t * 0.05f + j) * 8, 108 - t, 8 + t * 0.15f,
++                  6 + t * 0.12f, rgb(0x3A2020), 160 - static_cast<int>(t));
++        }
++      }
++      break;
++    }
++    case Biome::Space: {
++      drawStars(b, 140, 0.08f, false);
++      float px = 230 - cx * 0.06f;
++      ellipse(b, px, 70, 30, 30, rgb(0xE2894A));
++      ellipse(b, px - 6, 62, 22, 8, rgb(0xF0A868), 160);
++      ellipse(b, px + 4, 80, 24, 5, rgb(0xB8603A), 160);
++      for (int i = 0; i < 40; i++) {
++        float a = i * 2 * k_pi / 40;
++        float rx = 52 * cosf(a), ry = 11 * sinf(a) - rx * 0.12f;
++        if (sinf(a) < 0 && rx * rx + ry * ry < 900 && fabsf(rx) < 30) {
++          continue;  // behind the planet
++        }
++        ellipse(b, px + rx, 70 + ry, 2.2f, 1.6f, rgb(0xF3D9A6), 220);
++      }
++      // A comet
++      float t = fmodf(s.now * 0.05f, 900.f);
++      line(b, t - 100, 20 + t * 0.12f, t - 130, 16 + t * 0.12f, 2,
++           rgb(0xBFE6FF), 160);
++      break;
++    }
++    case Biome::Aquarium:
++      for (int i = 0; i < 5; i++) {
++        float x = 40 + i * 70 - fmodf(cx * 0.2f, 70.f) + sinf(s.now * 0.001f + i) * 6;
++        float pts[8] = {x, x + 22, x + 72, x + 40};
++        float ys[4] = {0, 0, static_cast<float>(k_floorY), k_floorY};
++        polygon(b, pts, ys, 4, rgb(0xBFEFFF), 22);
++      }
++      break;
++    case Biome::Disco: {
++      drawStars(b, 30, 0.1f, true);
++      float bx = 160, by = 26;
++      for (int i = 0; i < 6; i++) {
++        float a = s.now * 0.0012f + i * k_pi / 3;
++        float ex = bx + cosf(a) * 260, ey = by + 220;
++        float xs[3] = {bx, ex - 20, ex + 20};
++        float ys[3] = {by, ey, ey};
++        polygon(b, xs, ys, 3, hsv(i * 60 + s.now / 20, 200, 255), 40);
++      }
++      line(b, bx, 0, bx, by - 12, 1, rgb(0x888888));
++      ellipse(b, bx, by, 13, 13, rgb(0xC9CCD6));
++      for (int y = -12; y <= 12; y += 4) {
++        for (int x = -12; x <= 12; x += 4) {
++          if (x * x + y * y < 140 && hash(x * 31 + y + s.now / 150) % 3 == 0) {
++            fill(b, {static_cast<int>(bx) + x, static_cast<int>(by) + y, 2, 2},
++                 rgb(0xFFFFFF));
++          }
++        }
++      }
++      break;
++    }
++    default:
++      break;
++  }
++}
++
++void drawGround(Band& b) {
++  const BiomeInfo& bi = biome();
++  const Rect& clip = b.clip();
++  int floor = static_cast<int>(k_floorY) - s_shakeY;
++  if (clip.bottom() <= floor) {
++    return;
++  }
++  KDColor ground = rgb(bi.ground), edge = rgb(bi.edge);
++  KDColor dark = mix(ground, rgb(0x000000), 70);
++  int cx = static_cast<int>(camX());
++  for (int y = clip.y > floor ? clip.y : floor; y < clip.bottom(); y++) {
++    KDColor* row = b.row(y);
++    int d = y - floor;
++    for (int x = clip.x; x < clip.right(); x++) {
++      int wx = x + cx;
++      KDColor c;
++      if (s.biome == Biome::Disco) {
++        int tile = ((wx + 4000) / 26) + (d / 9) * 7;
++        int on = (hash(tile + (s.now / 460) * 131) % 3) == 0;
++        c = on ? hsv((tile * 47 + s.now / 30) % 360, 200, 230)
++               : rgb(0x1E0C30);
++        if ((wx + 4000) % 26 == 0 || d % 9 == 0) {
++          c = rgb(0x0A0412);
++        }
++      } else if (d < 3) {
++        c = edge;
++      } else {
++        c = mix(ground, dark, d * 6);
++        uint32_t h = hash(((wx + 4000) >> 2) * 73856093u ^ ((d >> 2) * 19349663u));
++        if ((h & 7) == 0) {
++          c = mix(c, dark, 160);
++        } else if ((h & 31) == 1) {
++          c = mix(c, edge, 90);
++        }
++        if (s.biome == Biome::Volcano && (h % 23) == 0) {
++          int glow = static_cast<int>(160 + 90 * sinf(s.now * 0.004f + (h & 63)));
++          c = mix(rgb(0xFF4A12), rgb(0xFFD040), glow - 100);
++        }
++      }
++      row[x] = c;
++    }
++  }
++}
++
++void drawDecor(Band& b) {
++  // Things on the ground, every 46 px (hashed)
++  float cx = camX();
++  int first = static_cast<int>(cx / 46) - 1;
++  for (int k = first; k < first + 9; k++) {
++    uint32_t h = hash(k * 2654435761u + static_cast<int>(s.biome));
++    float x = k * 46.f + (h % 30) - cx;
++    float y = k_floorY - s_shakeY;
++    switch (s.biome) {
++      case Biome::Garden:
++        if (h % 3 != 0) {
++          KDColor petal = hsv((h >> 8) % 360, 150, 255);
++          line(b, x, y, x + 1, y - 10, 1.5f, rgb(0x2F7D32));
++          for (int p = 0; p < 5; p++) {
++            float a = p * 2 * k_pi / 5;
++            ellipse(b, x + 1 + cosf(a) * 3, y - 11 + sinf(a) * 3, 2.4f, 2.4f, petal);
++          }
++          ellipse(b, x + 1, y - 11, 1.8f, 1.8f, rgb(0xFFE14A));
++        }
++        break;
++      case Biome::Night:
++        if (h % 3 == 0) {
++          float glow = 0.6f + 0.4f * sinf(s.now * 0.002f + (h & 15));
++          ellipse(b, x, y - 8, 12, 9, rgb(0x5CF2FF), static_cast<int>(50 * glow));
++          fill(b, {static_cast<int>(x) - 1, static_cast<int>(y) - 7, 3, 7}, rgb(0xD8F6FF));
++          ellipse(b, x, y - 8, 7, 4, rgb(0x34D6F0));
++          ellipse(b, x - 2, y - 9, 1.5f, 1, rgb(0xFFFFFF));
++        }
++        break;
++      case Biome::Volcano:
++        if (h % 4 == 0) {
++          float xs[3] = {x - 6, x + 6, x + 1};
++          float ys[3] = {y, y, y - 14 - static_cast<float>(h % 8)};
++          polygon(b, xs, ys, 3, rgb(0x3B1A14));
++        }
++        break;
++      case Biome::Space:
++        if (h % 2 == 0) {
++          float r = 5 + (h >> 4) % 9;
++          ellipse(b, x, y + 8 + (h >> 9) % 14, r, r * 0.35f, rgb(0x6C6C7A));
++          ellipse(b, x, y + 7 + (h >> 9) % 14, r * 0.8f, r * 0.22f, rgb(0x5A5A66));
++        }
++        break;
++      case Biome::Aquarium:
++        if (h % 2 == 0) {
++          float hgt = 26 + (h >> 5) % 40;
++          for (int sgm = 0; sgm < 6; sgm++) {
++            float t0 = sgm / 6.f, t1 = (sgm + 1) / 6.f;
++            float sw = sinf(s.now * 0.002f + k) * 7;
++            line(b, x + sw * t0 * t0, y - hgt * t0, x + sw * t1 * t1,
++                 y - hgt * t1, 3.f - 2 * t0, rgb(0x2E9A5A));
++          }
++        }
++        break;
++      default:
++        break;
++    }
++  }
++}
++
++void drawSign(Band& b, float wx, const char* label) {
++  float x = wx - camX(), y = k_floorY - s_shakeY;
++  if (x < -60 || x > k_screenWidth + 60) {
++    return;
++  }
++  fill(b, {static_cast<int>(x) - 2, static_cast<int>(y) - 34, 4, 34}, rgb(0x6B4423));
++  int w = textWidth(label) + 12;
++  Rect r = {static_cast<int>(x) - w / 2, static_cast<int>(y) - 52, w, 20};
++  roundFill(b, r, 4, rgb(0x8A5A2B));
++  roundFrame(b, r, 4, rgb(0x4A2E14));
++  text(b, label, static_cast<int>(x), r.y + 3, rgb(0xFFF2D6), Small, Align::Center);
++}
++
++void drawPlatforms(Band& b) {
++  const BiomeInfo& bi = biome();
++  for (int i = 0; i < s_numberOfPlatforms; i++) {
++    const Platform& p = s_platforms[i];
++    int x = p.x - static_cast<int>(camX()), y = p.y + s_shakeY * -1;
++    if (x > k_screenWidth || x + p.w < 0) {
++      continue;
++    }
++    KDColor top = rgb(bi.edge);
++    KDColor body = mix(rgb(bi.ground), rgb(0xFFFFFF), 30);
++    if (s.biome == Biome::Garden || s.biome == Biome::Night) {
++      // A mushroom
++      fill(b, {x + p.w / 2 - 5, y + 6, 10, static_cast<int>(k_floorY) - y - 6},
++           rgb(0xF2E6CF));
++      roundFill(b, {x, y, p.w, 11}, 5,
++                s.biome == Biome::Night ? rgb(0x7A4CFF) : rgb(0xE8443A));
++      for (int d = 0; d < 3; d++) {
++        ellipse(b, x + 10 + d * 20, y + 4, 3, 2, rgb(0xFFFFFF));
++      }
++    } else {
++      roundFill(b, {x, y, p.w, 9}, 4, body);
++      fill(b, {x + 2, y, p.w - 4, 2}, top);
++      roundFrame(b, {x, y, p.w, 9}, 4, mix(body, rgb(0x000000), 120));
++    }
++  }
++}
++
++void drawCandy(Band& b, float x, float y, int i, float scale, int alpha,
++               bool highlight) {
++  if (isGame(i)) {
++    int sz = static_cast<int>(30 * scale);
++    Rect box = {static_cast<int>(x) - sz / 2, static_cast<int>(y) - sz / 2, sz, sz};
++    roundFill(b, box, 5, rgb(0xE8463C), alpha);
++    if (alpha >= 256 && scale > 0.6f) {
++      Ion::ExternalApps::App app =
++          AppsContainer::sharedAppsContainer()->externalAppAtIndex(
++              s_items[i].item.index);
++      int icon = sz - 8;
++      gameIcon(b, app, box.x + 4, box.y + 4, icon);
++    }
++    roundFrame(b, box, 5, rgb(0xFFD23C), alpha);
++    ellipse(b, x - 6 * scale, box.y - 2, 6 * scale, 4 * scale, rgb(0xFFD23C), alpha);
++    ellipse(b, x + 6 * scale, box.y - 2, 6 * scale, 4 * scale, rgb(0xFFD23C), alpha);
++    ellipse(b, x, box.y - 1, 2.5f * scale, 2.5f * scale, rgb(0xE0A800), alpha);
++  } else {
++    KDColor c = itemColor(i);
++    KDColor wrap = mix(c, rgb(0xFFFFFF), 90);
++    KDColor dark = mix(c, rgb(0x0B0B1A), 150);
++    float r = 14 * scale;
++    for (int side = -1; side <= 1; side += 2) {
++      float xs[3] = {x + side * (r - 3), x + side * (r + 10 * scale),
++                     x + side * (r + 10 * scale)};
++      float ys[3] = {y, y - 9 * scale, y + 9 * scale};
++      float xo[3] = {xs[0], xs[1] + side, xs[2] + side};
++      float yo[3] = {ys[0], ys[1] - 1.5f, ys[2] + 1.5f};
++      polygon(b, xo, yo, 3, dark, alpha);
++      polygon(b, xs, ys, 3, wrap, alpha);
++    }
++    ellipse(b, x, y, r + 1.6f, r + 1.6f, dark, alpha);
++    ellipse(b, x, y, r, r, c, alpha);
++    // A swirl of light
++    arc(b, x, y, r * 0.62f, 2.f * scale, 2, mix(c, rgb(0xFFFFFF), 70), alpha / 2);
++    ellipse(b, x - r * 0.38f, y - r * 0.42f, r * 0.34f, r * 0.2f, rgb(0xFFFFFF),
++            alpha * 3 / 5);
++    if (scale > 0.7f && alpha >= 200) {
++      char sym[8];
++      itemSymbol(i, sym);
++      int ty = static_cast<int>(y) - glyphHeight() / 2;
++      KDColor ink = rgb(0x1A1030);
++      text(b, sym, static_cast<int>(x) + 1, ty + 1, ink, Small, Align::Center,
++           k_screenWidth, 160);
++      text(b, sym, static_cast<int>(x), ty, rgb(0xFFFFFF), Small, Align::Center);
++    }
++  }
++  if (highlight) {
++    float pulse = 3 + 2 * sinf(s.now * 0.012f);
++    arc(b, x, y, 19 * scale + pulse, 2, 0, rgb(0xFFFFFF), 200);
++  }
++}
++
++void drawPellet(Band& b, float x, float y, const char* t, int alpha,
++                bool highlight) {
++  int w = textWidth(t) + 10;
++  Rect r = {static_cast<int>(x) - w / 2, static_cast<int>(y) - 9, w, 18};
++  roundFill(b, {r.x + 1, r.y + 2, r.w, r.h}, 7, rgb(0x000000), alpha / 4);
++  roundFill(b, r, 7, rgb(0xF6D79C), alpha);
++  roundFrame(b, r, 7, rgb(0x8A5A2B), alpha);
++  // Biscuit dots
++  fill(b, {r.x + 3, r.y + 3, 1, 1}, rgb(0xC08A4A), alpha);
++  fill(b, {r.right() - 4, r.bottom() - 4, 1, 1}, rgb(0xC08A4A), alpha);
++  text(b, t, static_cast<int>(x), r.y + 2, rgb(0x4A2A10), Small, Align::Center,
++       k_screenWidth, alpha);
++  if (highlight) {
++    roundFrame(b, {r.x - 3, r.y - 3, r.w + 6, r.h + 6}, 9, rgb(0xFFFFFF),
++               static_cast<int>(150 + 100 * sinf(s.now * 0.012f)));
++  }
++}
++
++void drawEye(Band& b, float ex, float ey, float rx, float ry, float lx, float ly,
++             Face face, KDColor body, int side) {
++  KDColor ink = rgb(0x14101E);
++  switch (face) {
++    case Face::Joy:
++    case Face::Chew:
++      arc(b, ex, ey + ry * 0.4f, rx * 0.85f, 2.2f, 1, ink);
++      return;
++    case Face::Sleep:
++      arc(b, ex, ey - ry * 0.2f, rx * 0.8f, 2.f, 2, ink);
++      return;
++    case Face::Love:
++      heart(b, static_cast<int>(ex - 9), static_cast<int>(ey - 7), 2, rgb(0xFF2E63));
++      return;
++    case Face::Sick:
++      line(b, ex - rx * 0.7f, ey - ry * 0.5f, ex + rx * 0.7f, ey + ry * 0.5f, 2.2f, ink);
++      line(b, ex - rx * 0.7f, ey + ry * 0.5f, ex + rx * 0.7f, ey - ry * 0.5f, 2.2f, ink);
++      return;
++    case Face::Dizzy: {
++      ellipse(b, ex, ey, rx + 1, ry + 1, ink);
++      ellipse(b, ex, ey, rx, ry, rgb(0xFFFFFF));
++      arc(b, ex, ey, rx * 0.55f, 1.6f, 0, ink);
++      float a = s.now * 0.02f * side;
++      ellipse(b, ex + cosf(a) * rx * 0.3f, ey + sinf(a) * ry * 0.3f, 2, 2, ink);
++      return;
++    }
++    default:
++      break;
++  }
++  bool blink = (s.now % 3900) < 110 && face != Face::Wow && face != Face::Evil;
++  if (blink) {
++    line(b, ex - rx, ey, ex + rx, ey, 2, ink);
++    return;
++  }
++  float pr = rx * (face == Face::Wow ? 0.38f : 0.56f);
++  ellipse(b, ex, ey, rx + 1.4f, ry + 1.4f, ink);
++  ellipse(b, ex, ey, rx, ry, face == Face::Evil ? rgb(0xFFE3E3) : rgb(0xFFFFFF));
++  float px = ex + lx * (rx - pr) * 0.8f, py = ey + ly * (ry - pr) * 0.6f;
++  if (face == Face::Evil) {
++    ellipse(b, px, py, pr + 2, pr + 2, rgb(0xFF0000), 100);
++    ellipse(b, px, py, pr, pr, rgb(0xE00000));
++  } else {
++    ellipse(b, px, py, pr, pr, ink);
++  }
++  ellipse(b, px - pr * 0.35f, py - pr * 0.4f, pr * 0.32f, pr * 0.32f, rgb(0xFFFFFF));
++  if (face == Face::Hungry) {
++    // Heavy eyelid
++    fill(b, {static_cast<int>(ex - rx - 2), static_cast<int>(ey - ry - 2),
++             static_cast<int>(2 * rx + 5), static_cast<int>(ry + 1)}, body);
++    line(b, ex - rx - 1, ey - 1, ex + rx + 1, ey - 1, 2, ink);
++  }
++  if (face == Face::Angry || face == Face::Evil) {
++    line(b, ex - rx * 1.1f * side, ey - ry * 1.5f, ex + rx * 0.9f * side,
++         ey - ry * 0.75f, 3, ink);
++  }
++}
++
++// The face, the hats: drawn over the body. (cx, cy) on screen.
++void drawFace(Band& b, float cx, float cy, float hw, float hh, Face face,
++              KDColor body, float lx, float ly) {
++  float big = s.stage == 0 ? 0.25f : 0.21f;
++  float rx = hw * big, ry = rx * 1.2f * (hh / (hw > 1 ? hw : 1));
++  ry = ry < 2 ? 2 : ry;
++  float ex = hw * 0.37f, ey = cy - hh * 0.17f;
++  float shift = lx * hw * 0.08f;
++  bool glasses = s.costume == 4 || (s.tanned && s.costume == 0);
++  if (glasses) {
++    face = face == Face::Sleep ? face : Face::Happy;
++  }
++  drawEye(b, cx - ex + shift, ey, rx, ry, lx, ly, face, body, -1);
++  drawEye(b, cx + ex + shift, ey, rx, ry, lx, ly, face, body, 1);
++  KDColor ink = rgb(0x14101E);
++  float mx = cx + shift * 1.5f, my = cy + hh * 0.24f;
++  float mw = hw * 0.2f;
++  // Cheeks
++  if (face == Face::Happy || face == Face::Joy || face == Face::Love ||
++      face == Face::Chew) {
++    float puff = face == Face::Chew ? 1.6f : 1.f;
++    ellipse(b, cx - ex * 1.25f + shift, my - 2, hw * 0.13f * puff, hh * 0.08f * puff,
++            rgb(0xFF6A8E), 110);
++    ellipse(b, cx + ex * 1.25f + shift, my - 2, hw * 0.13f * puff, hh * 0.08f * puff,
++            rgb(0xFF6A8E), 110);
++  }
++  switch (face) {
++    case Face::Happy:
++    case Face::Love:
++      arc(b, mx, my - mw * 0.6f, mw, 2.2f, 2, ink);
++      break;
++    case Face::Joy:
++    case Face::Evil:
++      ellipse(b, mx, my, mw * 1.1f + 1.2f, hh * 0.15f + 1.2f, ink);
++      ellipse(b, mx, my + hh * 0.06f, mw * 0.7f, hh * 0.07f, rgb(0xFF5C7A));
++      fill(b, {static_cast<int>(mx - mw * 1.1f), static_cast<int>(my - hh * 0.16f),
++               static_cast<int>(mw * 2.2f + 2), static_cast<int>(hh * 0.12f)},
++           body);
++      if (face == Face::Evil) {
++        for (int t = -1; t <= 1; t += 2) {
++          float xs[3] = {mx + t * mw * 0.5f - 2, mx + t * mw * 0.5f + 2, mx + t * mw * 0.5f};
++          float ys[3] = {my - hh * 0.04f, my - hh * 0.04f, my + 3};
++          polygon(b, xs, ys, 3, rgb(0xFFFFFF));
++        }
++      }
++      break;
++    case Face::Wow:
++      ellipse(b, mx, my, mw * 0.55f + 1, hh * 0.13f + 1, ink);
++      ellipse(b, mx, my + 1, mw * 0.3f, hh * 0.06f, rgb(0xFF5C7A));
++      break;
++    case Face::Sleep:
++      ellipse(b, mx, my, 2.5f, 2, ink);
++      {
++        float r = 3 + 3 * (0.5f + 0.5f * sinf(s.now * 0.003f));
++        ellipse(b, cx + ex * 0.4f + shift, cy + hh * 0.05f + r, r, r,
++                rgb(0xBFE8FF), 130);
++      }
++      break;
++    case Face::Angry:
++      line(b, mx - mw, my, mx + mw, my, 2.2f, ink);
++      break;
++    case Face::Sick:
++    case Face::Dizzy:
++      for (int k = 0; k < 4; k++) {
++        float x0 = mx - mw + k * mw * 0.5f;
++        line(b, x0, my + (k % 2 ? 2 : -1), x0 + mw * 0.5f, my + (k % 2 ? -1 : 2), 2,
++             ink);
++      }
++      break;
++    case Face::Hungry:
++      arc(b, mx, my + mw * 0.6f, mw * 0.8f, 2.f, 1, ink);
++      {
++        float d = fmodf(s.now * 0.02f, 18.f);
++        ellipse(b, mx + mw * 0.7f, my + 2 + d, 1.6f, 2.2f, rgb(0xBFE8FF), 220);
++      }
++      break;
++    case Face::Chew: {
++      float o = (s.now / 170) % 2 ? 2.5f : 0.8f;
++      ellipse(b, mx, my, mw * 0.6f, o, ink);
++      break;
++    }
++  }
++  if (glasses) {
++    KDColor lens = rgb(0x101018);
++    roundFill(b, {static_cast<int>(cx - ex + shift - rx * 1.4f), static_cast<int>(ey - ry),
++                  static_cast<int>(rx * 2.8f), static_cast<int>(ry * 1.8f + 1)},
++              3, lens);
++    roundFill(b, {static_cast<int>(cx + ex + shift - rx * 1.4f), static_cast<int>(ey - ry),
++                  static_cast<int>(rx * 2.8f), static_cast<int>(ry * 1.8f + 1)},
++              3, lens);
++    line(b, cx - ex + shift, ey - ry * 0.5f, cx + ex + shift, ey - ry * 0.5f, 2, lens);
++    line(b, cx - ex + shift - rx, ey + ry * 0.4f, cx - ex + shift - rx * 0.2f,
++         ey - ry * 0.6f, 1.2f, rgb(0xFFFFFF), 160);
++  }
++  if (s.costume == 5) {
++    for (int t = -1; t <= 1; t += 2) {
++      ellipse(b, mx + t * mw * 0.7f, my - hh * 0.1f, mw * 0.75f, hh * 0.06f + 1, rgb(0x3A2414));
++      ellipse(b, mx + t * mw * 1.45f, my - hh * 0.14f, 2, 2, rgb(0x3A2414));
++    }
++  }
++}
++
++void drawHats(Band& b, float cx, float top, float hw) {
++  int costume = s.costume;
++  if (costume == 0 && s.stage == 3) {
++    costume = 3;  // the supreme glutton wears a crown
++  }
++  if (s.stage >= 1 && costume == 0) {
++    // A little sprout
++    float sway = sinf(s.now * 0.004f) * 2;
++    line(b, cx, top + 2, cx + sway, top - 7, 1.6f, rgb(0x2F7D32));
++    ellipse(b, cx + sway + 4, top - 8, 4.5f, 2.4f, rgb(0x4CC24A));
++    if (s.stage >= 2) {
++      ellipse(b, cx + sway - 4, top - 6, 3.5f, 2.f, rgb(0x4CC24A));
++    }
++  }
++  switch (costume) {
++    case 1: {
++      float xs[3] = {cx - 9, cx + 9, cx + 3};
++      float ys[3] = {top + 3, top + 3, top - 22};
++      polygon(b, xs, ys, 3, rgb(0xFF4FA3));
++      line(b, cx - 5, top - 4, cx + 6, top - 7, 2, rgb(0xFFE14A));
++      line(b, cx - 2, top - 12, cx + 5, top - 14, 2, rgb(0x5CE1FF));
++      ellipse(b, cx + 3, top - 22, 3.5f, 3.5f, rgb(0xFFE14A));
++      break;
++    }
++    case 2:
++      fill(b, {static_cast<int>(cx - 15), static_cast<int>(top - 2), 30, 4}, rgb(0x15151C));
++      fill(b, {static_cast<int>(cx - 10), static_cast<int>(top - 22), 20, 21}, rgb(0x15151C));
++      fill(b, {static_cast<int>(cx - 10), static_cast<int>(top - 7), 20, 4}, rgb(0xD7263D));
++      break;
++    case 3: {
++      float xs[7] = {cx - 13, cx - 13, cx - 6, cx, cx + 6, cx + 13, cx + 13};
++      float ys[7] = {top + 3, top - 11, top - 4, top - 15, top - 4, top - 11, top + 3};
++      polygon(b, xs, ys, 7, rgb(0xFFC928));
++      ellipse(b, cx, top - 3, 2.5f, 2.5f, rgb(0xE8243C));
++      ellipse(b, cx - 8, top - 2, 2, 2, rgb(0x2E8BFF));
++      ellipse(b, cx + 8, top - 2, 2, 2, rgb(0x2E8BFF));
++      break;
++    }
++    case 6:
++      for (int i = 0; i < 18; i++) {
++        float a = i * 2 * k_pi / 18 + s.now * 0.002f;
++        ellipse(b, cx + cosf(a) * (hw * 0.55f), top - 9 + sinf(a) * 3.5f, 1.8f, 1.8f,
++                rgb(0xFFE76A));
++      }
++      break;
++    default:
++      break;
++  }
++}
++
++void drawBlobAndCo(Band& b) {
++  float cx = camX(), cy = camY();
++  KDColor body = baseColor();
++  bool glow = s.biome == Biome::Night || s.biome == Biome::Disco;
++  // Minis
++  for (int i = 0; i < s.numberOfMinis; i++) {
++    const Mini& m = s.minis[i];
++    float x = m.x - cx, y = m.y - cy;
++    float rx = 8 * (1 + m.squash * 0.6f), ry = 8 * (1 - m.squash * 0.6f);
++    float yy = y + (8 - ry) * (s.flipped ? -1 : 1);
++    ellipse(b, x, yy, rx + 1.5f, ry + 1.5f, mix(body, rgb(0x0B0B1A), 170));
++    ellipse(b, x, yy, rx, ry, body);
++    ellipse(b, x - rx * 0.35f, yy - ry * 0.45f, rx * 0.3f, ry * 0.2f, rgb(0xFFFFFF), 170);
++    float look = s.blob.x() > m.x ? 1.f : -1.f;
++    for (int e = -1; e <= 1; e += 2) {
++      ellipse(b, x + e * 3.f, yy - 1.5f, 2.2f, 2.6f, rgb(0xFFFFFF));
++      ellipse(b, x + e * 3.f + look * 0.8f, yy - 1.2f, 1.2f, 1.4f, rgb(0x14101E));
++    }
++  }
++  if (s.popping) {
++    return;
++  }
++  // Tongue (behind the body)
++  float mx, my;
++  mouth(&mx, &my);
++  if (s.eat == EatPhase::TongueOut || s.eat == EatPhase::TongueBack) {
++    float t = (s.now - s.eatStart) / (s.eat == EatPhase::TongueOut ? 130.f : 170.f);
++    t = t > 1 ? 1 : t;
++    float k = s.eat == EatPhase::TongueOut ? t : 1 - t;
++    float tx = mx + (s.eatToX - mx) * k, ty = my + (s.eatToY - my) * k;
++    line(b, mx - cx, my - cy, tx - cx, ty - cy, 7, rgb(0x8A1B3E));
++    line(b, mx - cx, my - cy, tx - cx, ty - cy, 4.5f, rgb(0xFF6F96));
++    ellipse(b, tx - cx, ty - cy, 5, 5, rgb(0xFF6F96));
++    if (s.eat == EatPhase::TongueBack) {
++      if (s.meal == Meal::Item) {
++        drawCandy(b, tx - cx, ty - cy, s.eatIndex, 0.85f, 256, false);
++      } else if (s.meal == Meal::Pellet) {
++        drawPellet(b, tx - cx, ty - cy, s.eaten.text, 256, false);
++      }
++    }
++  }
++  if (s.eat == EatPhase::Fly) {
++    float t = (s.now - s.eatStart) / 380.f;
++    t = t > 1 ? 1 : t;
++    float e = t * t;
++    float x = s.eatFromX + (mx - s.eatFromX) * e, y = s.eatFromY + (my - s.eatFromY) * e;
++    drawCandy(b, x - cx, y - cy - sinf(t * k_pi) * 40, s.eatIndex, 1.f - 0.3f * t,
++              256, false);
++  }
++  int alpha = s.ghost ? 95 : 236;
++  s.blob.render(b, cx, cy, body, alpha, glow);
++  float bx = s.blob.x() - cx, by = s.blob.y() - cy;
++  float hw = s.blob.halfWidth(), hh = s.blob.halfHeight();
++  // What it is digesting, seen through the jelly
++  if (s.eat == EatPhase::Chew || s.eat == EatPhase::Burp) {
++    float t = (s.now - s.eatStart) / 680.f;
++    t = s.eat == EatPhase::Burp ? 1 : (t > 1 ? 1 : t);
++    float sc = 0.75f - 0.45f * t;
++    if (s.meal == Meal::Item) {
++      drawCandy(b, bx, by + hh * 0.2f, s.eatIndex, sc, 150, false);
++    } else {
++      drawPellet(b, bx, by + hh * 0.25f, s.eaten.text, 150 - static_cast<int>(100 * t),
++                 false);
++    }
++  }
++  // Gloss
++  ellipse(b, bx - hw * 0.42f, by - hh * 0.48f, hw * 0.26f, hh * 0.15f, rgb(0xFFFFFF),
++          s.ghost ? 80 : 190);
++  ellipse(b, bx - hw * 0.1f, by - hh * 0.66f, hw * 0.07f, hh * 0.05f, rgb(0xFFFFFF),
++          s.ghost ? 80 : 200);
++  // Where it looks
++  float lx = s.facing * 0.6f, ly = 0;
++  if (s.targetKind == 1) {
++    lx = (s_items[s.targetIndex].x - s.blob.x()) / 80.f;
++    ly = (s_items[s.targetIndex].y - s.blob.y()) / 80.f;
++  } else if (s.targetKind == 2) {
++    lx = (s.pellets[s.targetIndex].x - s.blob.x()) / 80.f;
++    ly = (s.pellets[s.targetIndex].y - s.blob.y()) / 80.f;
++  }
++  lx = lx < -1 ? -1 : (lx > 1 ? 1 : lx);
++  ly = ly < -1 ? -1 : (ly > 1 ? 1 : ly);
++  drawFace(b, bx, by, hw, hh, currentFace(), mix(body, rgb(0xFFFFFF), 40), lx, ly);
++  drawHats(b, bx, s.blob.top() - cy, hw);
++}
++
++void drawParticles(Band& b) {
++  float cx = camX(), cy = camY();
++  const Rect& clip = b.clip();
++  for (const Particle& p : s.particles) {
++    if (p.life == 0) {
++      continue;
++    }
++    int x = static_cast<int>(p.x - cx), y = static_cast<int>(p.y - cy);
++    if (y < clip.y - 20 || y > clip.bottom() + 20 || x < -20 || x > k_screenWidth + 20) {
++      continue;
++    }
++    int a = p.life * 256 / p.maxLife;
++    a = a > 200 ? 256 : a + 56;
++    switch (p.kind) {
++      case PKind::Confetti:
++      case PKind::Crumb:
++        fill(b, {x, y, p.size, p.size}, p.color(), a);
++        break;
++      case PKind::Spark:
++        fill(b, {x - p.size, y, 2 * p.size + 1, 1}, p.color(), a);
++        fill(b, {x, y - p.size, 1, 2 * p.size + 1}, p.color(), a);
++        break;
++      case PKind::Zzz:
++        text(b, p.life > p.maxLife / 2 ? "z" : "Z", x, y, p.color(), Small, Align::Left,
++             k_screenWidth, a);
++        break;
++      case PKind::Bubble:
++        arc(b, x, y, p.size, 1.f, 0, p.color(), a * 3 / 4);
++        fill(b, {x - p.size / 2, y - p.size / 2, 1, 1}, rgb(0xFFFFFF), a);
++        break;
++      case PKind::Ember:
++        ellipse(b, x, y, p.size + 0.5f, p.size + 0.5f, p.color(), a);
++        break;
++      case PKind::Heart:
++        heart(b, x - 4, y - 4, 1, p.color(), a);
++        break;
++      case PKind::Note:
++        ellipse(b, x, y, 3, 2.2f, p.color(), a);
++        line(b, x + 2.5f, y, x + 2.5f, y - 9, 1.2f, p.color(), a);
++        line(b, x + 2.5f, y - 9, x + 6, y - 6, 1.2f, p.color(), a);
++        break;
++      case PKind::Drop:
++        ellipse(b, x, y, p.size + 1.2f, p.size + 1.2f, mix(p.color(), rgb(0x0B0B1A), 170));
++        ellipse(b, x, y, p.size, p.size, p.color());
++        ellipse(b, x - p.size * 0.3f, y - p.size * 0.4f, p.size * 0.3f, p.size * 0.25f,
++                rgb(0xFFFFFF), 180);
++        break;
++      case PKind::Steam:
++      case PKind::Dust: {
++        float grow = 1 + (1 - p.life / static_cast<float>(p.maxLife)) * 1.5f;
++        ellipse(b, x, y, p.size * grow, p.size * grow * 0.8f, p.color(), a / 3);
++        break;
++      }
++      case PKind::Firefly: {
++        int g = static_cast<int>(130 + 120 * sinf(s.now * 0.006f + p.maxLife));
++        ellipse(b, x, y, 4, 4, p.color(), g / 4);
++        ellipse(b, x, y, 1.3f, 1.3f, p.color(), g);
++        break;
++      }
++    }
++  }
++}
++
++void drawBubble(Band& b) {
++  if (s.message.text[0] == 0 || s.mode != Mode::World) {
++    return;
++  }
++  // Split the lines
++  const char* lines[3];
++  int lens[3];
++  int n = 0;
++  const char* p = s.message.text;
++  while (n < 3) {
++    const char* e = strchr(p, '\n');
++    lines[n] = p;
++    lens[n] = e ? static_cast<int>(e - p) : static_cast<int>(strlen(p));
++    n++;
++    if (!e) {
++      break;
++    }
++    p = e + 1;
++  }
++  char buf[3][60];
++  int w = 0;
++  for (int i = 0; i < n; i++) {
++    int l = lens[i] < 59 ? lens[i] : 59;
++    memcpy(buf[i], lines[i], l);
++    buf[i][l] = 0;
++    int tw = textWidth(buf[i]);
++    w = tw > w ? tw : w;
++  }
++  int lh = glyphHeight();
++  int bw = w + 14, bh = n * lh + 8;
++  float bx = s.blob.x() - camX(), top = s.blob.top() - camY();
++  bool below = top - bh - 14 < 2 || s.flipped;
++  int x = static_cast<int>(bx) - bw / 2;
++  x = clampi(x, 3, k_screenWidth - bw - 3);
++  int y = below ? static_cast<int>(s.blob.bottom() - camY()) + 12
++                : static_cast<int>(top) - bh - 12;
++  if (s.costume != 0 && !below) {
++    y -= 14;
++  }
++  y = clampi(y, 2, k_screenHeight - bh - 2);
++  // Pop-in
++  uint32_t age = s.now - s.messageStart;
++  int alpha = age < 120 ? static_cast<int>(age * 256 / 120) : 256;
++  Rect r = {x, y, bw, bh};
++  KDColor ink = rgb(0x1A1030);
++  roundFill(b, {r.x + 2, r.y + 3, r.w, r.h}, 8, rgb(0x000000), alpha / 4);
++  roundFill(b, r, 8, rgb(0xFFFFFF), alpha);
++  roundFrame(b, r, 8, ink, alpha);
++  float tx = clampi(static_cast<int>(bx), x + 10, x + bw - 10);
++  float tipY = below ? y - 7 : y + bh + 7;
++  float baseY = below ? y + 1 : y + bh - 1;
++  float xs[3] = {tx - 6, tx + 6, tx + (below ? 0 : -2)};
++  float ys[3] = {baseY, baseY, tipY};
++  polygon(b, xs, ys, 3, ink, alpha);
++  float xs2[3] = {tx - 4, tx + 4, tx + (below ? 0 : -1.5f)};
++  float ys2[3] = {baseY + (below ? 1 : -1), baseY + (below ? 1 : -1),
++                  tipY + (below ? 2 : -2)};
++  polygon(b, xs2, ys2, 3, rgb(0xFFFFFF), alpha);
++  for (int i = 0; i < n; i++) {
++    text(b, buf[i], x + bw / 2, y + 4 + i * lh, ink, Small, Align::Center,
++         k_screenWidth, alpha);
++  }
++}
++
++int batteryPercent() {
++  float v = Ion::Battery::voltage();
++  int p = static_cast<int>((v - 3.6f) * 100.f / (4.15f - 3.6f));
++  return p < 0 ? 0 : (p > 100 ? 100 : p);
++}
++
++void drawHud(Band& b) {
++  if (!s.hud || (b.clip().y > 30 && b.clip().bottom() < 200)) {
++    return;
++  }
++  KDColor ink = rgb(0x1A1030);
++  // Hunger gauge, with a little face
++  Rect pill = {4, 4, 116, 20};
++  roundFill(b, pill, 10, rgb(0xFFFFFF), 215);
++  roundFrame(b, pill, 10, ink, 200);
++  KDColor body = baseColor();
++  ellipse(b, 15, 14, 7, 6.5f, mix(body, ink, 160));
++  ellipse(b, 15, 14, 6, 5.5f, body);
++  fill(b, {12, 12, 2, 2}, ink);
++  fill(b, {17, 12, 2, 2}, ink);
++  text(b, "FAIM", 26, 7, ink, Small);
++  Rect bar = {62, 10, 52, 8};
++  roundFill(b, bar, 4, rgb(0xE3E0EA));
++  int w = static_cast<int>(52 * s.hunger / 100);
++  if (w > 2) {
++    KDColor c = s.hunger < 50 ? rgb(0x4CD964)
++                              : (s.hunger < 80 ? rgb(0xFFB020) : rgb(0xFF3B30));
++    if (s.hunger >= 80 && (s.now / 300) % 2) {
++      c = rgb(0xFF8A80);
++    }
++    roundFill(b, {bar.x, bar.y, w, bar.h}, 4, c);
++  }
++  // Battery
++  int bp = batteryPercent();
++  Rect bat = {k_screenWidth - 44, 6, 32, 15};
++  roundFill(b, {bat.x - 4, 4, 46, 20}, 10, rgb(0xFFFFFF), 215);
++  roundFrame(b, {bat.x - 4, 4, 46, 20}, 10, ink, 200);
++  frame(b, {bat.x + 2, 9, 24, 10}, ink);
++  fill(b, {bat.x + 26, 12, 2, 4}, ink);
++  fill(b, {bat.x + 4, 11, 20 * bp / 100, 6},
++       bp < 20 ? rgb(0xFF3B30) : rgb(0x34C759));
++  // Bottom hint
++  if (s.mode != Mode::World || b.clip().bottom() < 212) {
++    return;
++  }
++  char hint[60];
++  Str h(hint, sizeof(hint));
++  if (s.targetKind == 1 && s.eat == EatPhase::None) {
++    h.add("OK : manger ").add(itemName(s.targetIndex));
++  } else if (s.targetKind == 2 && s.eat == EatPhase::None) {
++    h.add("OK : avaler ").add(s.pellets[s.targetIndex].text);
++  } else if (s.now - s.modeStart < 25000 && s.launches == 0) {
++    h.add("< > bouger  haut sauter  OK langue");
++  } else {
++    return;
++  }
++  int tw = textWidth(hint) + 16;
++  Rect r = {(k_screenWidth - tw) / 2, 219, tw, 18};
++  roundFill(b, r, 9, rgb(0x1A1030), 200);
++  text(b, hint, k_screenWidth / 2, 221, rgb(0xFFFFFF), Small, Align::Center);
++}
++
++void drawBites(Band& b) {
++  for (int i = 0; i < s.numberOfBites; i++) {
++    const Bite& bt = s.bites[i];
++    disc(b, bt.x, bt.y, bt.r, rgb(0x000000));
++    for (int k = 0; k < 4; k++) {
++      float a = k * 1.7f + i;
++      disc(b, bt.x + static_cast<int>(cosf(a) * bt.r * 0.8f),
++           bt.y + static_cast<int>(sinf(a) * bt.r * 0.8f), bt.r / 2, rgb(0x000000));
++    }
++  }
++}
++
++void iris(Band& b, float cx, float cy, float r) {
++  const Rect& clip = b.clip();
++  for (int y = clip.y; y < clip.bottom(); y++) {
++    KDColor* row = b.row(y);
++    float dy = y + 0.5f - cy;
++    float half = r * r - dy * dy;
++    int x0 = clip.right(), x1 = clip.right();
++    if (half > 0) {
++      float hw = sqrtf(half);
++      x0 = static_cast<int>(cx - hw);
++      x1 = static_cast<int>(cx + hw);
++    } else {
++      x0 = clip.right();
++      x1 = clip.right();
++    }
++    for (int x = clip.x; x < clip.right(); x++) {
++      if (half <= 0 || x < x0 || x >= x1) {
++        row[x] = rgb(0x000000);
++      }
++    }
++  }
++}
++
++void renderWorld(Band& b) {
++  drawSky(b);
++  drawGround(b);
++  drawDecor(b);
++  drawSign(b, 60, "GLOUTON");
++  if (s_numberOfItems > s_numberOfBuiltin) {
++    drawSign(b, s_items[s_numberOfBuiltin].x - 50, "JEUX");
++  }
++  drawPlatforms(b);
++  float cx = camX(), cy = camY();
++  for (int i = 0; i < s_numberOfItems; i++) {
++    if (i == s.goneItem) {
++      continue;
++    }
++    float x = s_items[i].x - cx;
++    if (x < -40 || x > k_screenWidth + 40) {
++      continue;
++    }
++    float y = s_items[i].y + itemBob(i) - cy;
++    // Shadow on the floor
++    ellipse(b, x, k_floorY - cy + 1, 11, 3, rgb(0x000000), 50);
++    drawCandy(b, x, y, i, 1.f, 256, s.targetKind == 1 && s.targetIndex == i &&
++                                        s.eat == EatPhase::None);
++  }
++  for (int i = 0; i < k_maxPellets; i++) {
++    const Pellet& p = s.pellets[i];
++    if (!p.active || (s.eat == EatPhase::TongueOut && s.meal == Meal::Pellet &&
++                      s.eatIndex == i && false)) {
++      continue;
++    }
++    drawPellet(b, p.x - cx, p.y - cy, p.text, 256,
++               s.targetKind == 2 && s.targetIndex == i && s.eat == EatPhase::None);
++  }
++  drawBlobAndCo(b);
++  drawParticles(b);
++  if (s.now < s.evilUntil) {
++    fill(b, b.clip(), rgb(0xFF0000), 40);
++  }
++  if (s.now < s.sickUntil) {
++    fill(b, b.clip(), rgb(0x7AFF3A), 22);
++  }
++  drawBubble(b);
++  drawHud(b);
++}
++}  // namespace
++
++namespace {
++
++/* ================================================================ fridge */
++
++constexpr int k_fridgeColumns = 4;
++constexpr int k_fridgeRows = 3;
++
++void drawFridge(Band& b) {
++  KDColor ink = rgb(0x1A1030);
++  // Inside: cold light
++  const Rect& clip = b.clip();
++  for (int y = clip.y; y < clip.bottom(); y++) {
++    KDColor c = mix(rgb(0xF4FBFF), rgb(0xCFE6F5), y * 256 / k_screenHeight);
++    fill(b, {0, y, k_screenWidth, 1}, c);
++  }
++  fill(b, {0, 0, k_screenWidth, 36}, rgb(0xFFFFFF));
++  fill(b, {0, 36, k_screenWidth, 2}, rgb(0x9FC3DA));
++  text(b, "LE FRIGO DE GLOUTON", 12, 4, ink, Large);
++  text(b, "Choisis ce qu'il mange.", 12, 20, rgb(0x6A7A90), Small);
++  int page = s.menuSelected / (k_fridgeColumns * k_fridgeRows);
++  int first = page * k_fridgeColumns * k_fridgeRows;
++  for (int row = 0; row < k_fridgeRows; row++) {
++    int shelfY = 40 + row * 60 + 56;
++    // Glass shelf
++    fill(b, {6, shelfY, k_screenWidth - 12, 3}, rgb(0xFFFFFF), 200);
++    fill(b, {6, shelfY + 3, k_screenWidth - 12, 1}, rgb(0x8FB4CC), 200);
++    for (int col = 0; col < k_fridgeColumns; col++) {
++      int i = first + row * k_fridgeColumns + col;
++      if (i >= s_numberOfItems) {
++        continue;
++      }
++      int cx = 40 + col * 80, cy = 40 + row * 60;
++      bool sel = i == s.menuSelected;
++      if (sel) {
++        roundFill(b, {cx - 37, cy, 74, 55}, 8, rgb(0xFFF1A8));
++        roundFrame(b, {cx - 37, cy, 74, 55}, 8, rgb(0xE0A800));
++      }
++      float bob = sel ? 2 * sinf(s.now * 0.01f) : 0;
++      drawCandy(b, cx, cy + 20 + bob, i, sel ? 1.05f : 0.95f, 256, false);
++      text(b, itemName(i), cx, cy + 38, ink, Small, Align::Center, 78);
++    }
++  }
++  int pages = (s_numberOfItems + k_fridgeColumns * k_fridgeRows - 1) /
++              (k_fridgeColumns * k_fridgeRows);
++  fill(b, {0, 222, k_screenWidth, 18}, rgb(0xFFFFFF));
++  text(b, "OK : il le mange   Retour : fermer", k_screenWidth / 2, 224,
++       rgb(0x6A7A90), Small, Align::Center);
++  if (pages > 1) {
++    char p[8];
++    Str ps(p, sizeof(p));
++    ps.addInt(page + 1).add("/").addInt(pages);
++    text(b, p, k_screenWidth - 8, 20 - 1, rgb(0x6A7A90), Small, Align::Right);
++  }
++  // The door swings open
++  uint32_t t = s.now - s.modeStart;
++  if (t < 260) {
++    float k = 1 - t / 260.f;
++    k = k * k;
++    int w = static_cast<int>(k_screenWidth * k);
++    fill(b, {0, 0, w, k_screenHeight}, rgb(0xF2F4F7));
++    fill(b, {w - 3, 0, 3, k_screenHeight}, rgb(0xB8C2CC));
++    if (w > 30) {
++      roundFill(b, {w - 22, 80, 8, 70}, 4, rgb(0xB8C2CC));
++    }
++  }
++}
++
++/* ============================================================== notebook */
++
++void notebookLine(Band& b, int y, const char* label, const char* value) {
++  text(b, label, 128, y, rgb(0x6A5A8A), Small);
++  text(b, value, 312, y, rgb(0x1A1030), Small, Align::Right, 120);
++}
++
++void drawNotebook(Band& b) {
++  const Rect& clip = b.clip();
++  // Seyes paper
++  for (int y = clip.y; y < clip.bottom(); y++) {
++    KDColor c = rgb(0xFDF8EC);
++    if (y > 36 && (y - 36) % 16 == 0) {
++      c = rgb(0x9DB6E6);
++    } else if (y > 36 && (y - 36) % 4 == 0) {
++      c = rgb(0xDCE4F4);
++    }
++    fill(b, {0, y, k_screenWidth, 1}, c);
++  }
++  fill(b, {28, 0, 2, k_screenHeight}, rgb(0xF08A8A));
++  KDColor ink = rgb(0x1A1030);
++  if (s.notebookPage == 0) {
++    text(b, "CARNET DE SANT\xC3\x89", 40, 8, rgb(0xC0306A), Large);
++    // Portrait
++    KDColor body = baseColor();
++    ellipse(b, 76, 96, 37, 33, mix(body, ink, 170));
++    ellipse(b, 76, 96, 35, 31, body);
++    ellipse(b, 62, 80, 9, 5, rgb(0xFFFFFF), 180);
++    drawFace(b, 76, 96, 35, 31, currentFace() == Face::Sleep ? Face::Sleep : Face::Joy,
++             body, 0.3f, 0);
++    drawHats(b, 76, 64, 35);
++    text(b, k_stageNames[s.stage], 76, 134, ink, Small, Align::Center, 100);
++    // XP to the next stage
++    Rect bar = {36, 154, 80, 8};
++    roundFill(b, bar, 4, rgb(0xE3E0EA));
++    int w = 80;
++    if (s.stage < k_numberOfStages - 1) {
++      int from = k_stageXp[s.stage], to = k_stageXp[s.stage + 1];
++      w = 80 * (s.xp - from) / (to - from);
++    }
++    roundFill(b, {bar.x, bar.y, w < 4 ? 4 : w, 8}, 4, rgb(0x8E5CFF));
++    text(b, "\xC3\xA9volution", 76, 164, rgb(0x6A5A8A), Small, Align::Center);
++    char v[40];
++    Str st(v, sizeof(v));
++    int y = 38;
++    st.addInt(s.weight / 1000).add(",").addInt((s.weight / 100) % 10).add(" kg");
++    notebookLine(b, y, "Poids", v);
++    y += 16;
++    Str hs(v, sizeof(v));
++    hs.addInt(static_cast<int>(s.hunger)).add(" %");
++    notebookLine(b, y, "Faim", v);
++    y += 16;
++    Str ns(v, sizeof(v));
++    ns.addInt(s.numbersEaten);
++    notebookLine(b, y, "Nombres mang\xC3\xA9s", v);
++    y += 16;
++    Str as(v, sizeof(v));
++    as.addInt(s.appsEaten);
++    notebookLine(b, y, "Applis mang\xC3\xA9""es", v);
++    y += 16;
++    int fav = -1, best = 0;
++    for (int i = 0; i < s_numberOfItems; i++) {
++      if (s.appMeals[i] > best) {
++        best = s.appMeals[i];
++        fav = i;
++      }
++    }
++    notebookLine(b, y, "Plat pr\xC3\xA9""f\xC3\xA9r\xC3\xA9", fav >= 0 ? itemName(fav) : "?");
++    y += 16;
++    notebookLine(b, y, "Dernier repas", s.lastMeal[0] ? s.lastMeal : "rien :(");
++    y += 16;
++    Str ag(v, sizeof(v));
++    ag.addInt((s.now - s.birth) / 60000).add(" min");
++    notebookLine(b, y, "\xC3\x82ge", v);
++    y += 16;
++    notebookLine(b, y, "Costume", k_costumeNames[s.costume]);
++    y += 16;
++    notebookLine(b, y, "1 : LED vivante", s.ledOn ? "OUI" : "NON");
++    y += 16;
++    notebookLine(b, y, "2 : \xC3\x89""cran vivant", s.lightOn ? "OUI" : "NON");
++    text(b, "> page 2 : les touches magiques", 312, 222, rgb(0xC0306A), Small,
++         Align::Right);
++  } else {
++    text(b, "LES TOUCHES MAGIQUES", 40, 8, rgb(0xC0306A), Large);
++    static constexpr const char* k_keys[][2] = {
++        {"x^2", "gonfler"},
++        {"\xE2\x88\x9A", "d\xC3\xA9gonfler"},
++        {"\xC3\x97", "se cloner"},
++        {"\xC3\xB7", "fusionner"},
++        {"sin", "danser"},
++        {"cos", "costume"},
++        {"tan", "bronzer"},
++        {"i", "imaginaire"},
++        {"-", "gravit\xC3\xA9 -"},
++        {"ln", "dormir"},
++        {"effacer", "chatouiller"},
++        {"+", "un en-cas"},
++        {"Ans", "une blague"},
++        {"\xCF\x80", "f\xC3\xAAte du \xCF\x80"},
++        {"1 \xC3\xA0 6", "d\xC3\xA9""cors"},
++        {"var", "mode photo"},
++    };
++    for (int i = 0; i < count(k_keys); i++) {
++      int col = i / 8, row = i % 8;
++      int x = 38 + col * 142, y = 38 + row * 22;
++      int kw = textWidth(k_keys[i][0]) + 10;
++      roundFill(b, {x, y, kw, 18}, 5, rgb(0x2B2440));
++      text(b, k_keys[i][0], x + kw / 2, y + 2, rgb(0xFFFFFF), Small, Align::Center);
++      text(b, k_keys[i][1], x + kw + 5, y + 2, ink, Small, Align::Left,
++           138 - kw);
++    }
++    text(b, "< page 1", 40, 222, rgb(0xC0306A), Small);
++    if (!s.discoUnlocked) {
++      text(b, "6 : secret (fais-le grandir)", 312, 222, rgb(0x6A5A8A), Small,
++           Align::Right);
++    }
++  }
++}
++
++/* ================================================================== boot */
++
++void drawEgg(Band& b, float cx, float cy, float angle, int cracks) {
++  float rx = 20, ry = 26;
++  Rect z = Rect{static_cast<int>(cx - 34), static_cast<int>(cy - 34), 68, 68}
++               .intersection(b.clip());
++  float cs = cosf(angle), sn = sinf(angle);
++  for (int y = z.y; y < z.bottom(); y++) {
++    KDColor* row = b.row(y);
++    for (int x = z.x; x < z.right(); x++) {
++      float dx = x + 0.5f - cx, dy = y + 0.5f - cy;
++      float u = cs * dx + sn * dy, v = -sn * dx + cs * dy;
++      // Egg: narrower at the top
++      float rxx = rx * (v < 0 ? 0.85f + 0.15f * (1 + v / ry) : 1.f);
++      float d = (u * u) / (rxx * rxx) + (v * v) / (ry * ry);
++      if (d > 1.08f) {
++        continue;
++      }
++      KDColor c;
++      if (d > 0.9f) {
++        c = rgb(0x6B4A2B);
++      } else {
++        float shade = 0.5f + 0.35f * (u / rx) + 0.3f * (v / ry);
++        c = mix(rgb(0xFFF6E0), rgb(0xD9C49A), static_cast<int>(shade * 200));
++        uint32_t h = hash((static_cast<int>(u + 40) / 5) * 97 + static_cast<int>(v + 40) / 5);
++        if (h % 9 == 0) {
++          c = mix(c, rgb(0x7CC46F), 150);
++        }
++      }
++      row[x] = c;
++    }
++  }
++  // Cracks
++  static constexpr float k_crack[3][8] = {
++      {-14, -6, -8, 0, -2, -7, 4, -1},
++      {2, -16, 6, -9, 2, -3, 8, 3},
++      {-6, 6, 0, 12, 6, 5, 12, 10}};
++  for (int c = 0; c < cracks && c < 3; c++) {
++    for (int k = 0; k < 3; k++) {
++      float u0 = k_crack[c][2 * k], v0 = k_crack[c][2 * k + 1];
++      float u1 = k_crack[c][2 * k + 2], v1 = k_crack[c][2 * k + 3];
++      line(b, cx + cs * u0 - sn * v0, cy + sn * u0 + cs * v0, cx + cs * u1 - sn * v1,
++           cy + sn * u1 + cs * v1, 1.6f, rgb(0x3A2614));
++    }
++  }
++}
++
++void renderBoot(Band& b) {
++  uint32_t t = s.now - s.modeStart;
++  if (t >= 3600) {
++    renderWorld(b);
++  } else {
++    drawSky(b);
++    drawGround(b);
++    drawDecor(b);
++    float wob = 0;
++    if (t > 600) {
++      float k = (t - 600) / 3000.f;
++      float freq = 0.012f + k * 0.02f;
++      wob = sinf(t * freq) * (0.05f + 0.3f * k) * ((t / 700) % 2 ? 1 : 0.3f);
++    }
++    int cracks = t > 3200 ? 3 : (t > 2500 ? 2 : (t > 1600 ? 1 : 0));
++    ellipse(b, 160 - camX(), k_floorY + 1, 22, 4, rgb(0x000000), 70);
++    drawEgg(b, 160 - camX(), k_floorY - 25, wob, cracks);
++    if (t > 1000 && t < 3400) {
++      const char* toc = (t / 500) % 2 ? "toc..." : "toc toc";
++      text(b, toc, 196 - static_cast<int>(camX()), 150, rgb(0xFFFFFF), Small);
++    }
++    drawParticles(b);
++  }
++  // Title
++  if (t > 4200) {
++    static constexpr char k_title[] = "GLOUTON";
++    int n = 7;
++    int letterW = 24;
++    int x0 = k_screenWidth / 2 - n * letterW / 2;
++    for (int i = 0; i < n; i++) {
++      int lt = static_cast<int>(t) - 4200 - i * 90;
++      if (lt < 0) {
++        continue;
++      }
++      float drop = lt < 400 ? (1 - lt / 400.f) : 0;
++      float bounce = lt < 700 ? fabsf(sinf(lt * 0.012f)) * (1 - lt / 700.f) * 10 : 0;
++      int y = 36 - static_cast<int>(drop * drop * 80 + bounce) +
++              static_cast<int>(2 * sinf(s.now * 0.004f + i));
++      char c[2] = {k_title[i], 0};
++      KDColor col = hsv(100 + i * 12, 200, 250);
++      bigText(b, c, x0 + i * letterW + 2, y + 3, 3, rgb(0x0B2A14));
++      bigText(b, c, x0 + i * letterW, y, 3, col);
++    }
++  }
++  if (t > 5200) {
++    int a = t > 5600 ? 256 : static_cast<int>((t - 5200) * 256 / 400);
++    outlinedText(b, "ta calculatrice a faim.", k_screenWidth / 2, 98, rgb(0xFFFFFF),
++                 Small, Align::Center);
++    (void)a;
++  }
++  if (t < 400) {
++    fill(b, b.clip(), rgb(0x000000), 256 - static_cast<int>(t * 256 / 400));
++  }
++  if (t >= 3600 && t < 3900) {
++    fill(b, b.clip(), rgb(0xFFFFFF), 256 - static_cast<int>((t - 3600) * 256 / 300));
++  }
++}
++
++void updateBoot(float dt) {
++  uint32_t t = s.now - s.modeStart;
++  if (t >= 3600 && !s.initialized) {
++    return;
++  }
++  static bool hatched = false;
++  if (t < 3600) {
++    hatched = false;
++    s.camX = 0;
++    // The egg is warm: it beats
++    if ((t / 900) != ((t - static_cast<uint32_t>(dt * 1000)) / 900) && t > 600) {
++      shake(1.5f, 120);
++    }
++  } else if (!hatched) {
++    hatched = true;
++    s.blob.init(160, k_floorY - 30, k_stageRadius[0]);
++    s.blob.impulse(0, -260);
++    for (int i = 0; i < 14; i++) {
++      float a = frnd() * k_pi + k_pi;
++      spawn(PKind::Crumb, 160, k_floorY - 26, cosf(a) * 160, sinf(a) * 200, 1500,
++            rgb(0xFFF6E0), 3 + rnd() % 3);
++    }
++    confetti(160, k_floorY - 40, 30);
++    shake(5, 400);
++    flash(150);
++  }
++  if (t >= 3600) {
++    Control c = {0, false, false, false};
++    if (t > 4800 && (t / 600) != ((t - static_cast<uint32_t>(dt * 1000)) / 600)) {
++      c.jump = true;  // happy little hops
++    }
++    s.blob.step(dt, environment(), c);
++    s.blob.takeImpact();
++  }
++  updateParticles(dt);
++}
++
++/* ============================================================= overlays */
++
++void drawEvolution(Band& b) {
++  uint32_t t = s.now - s.evolveStart;
++  if (t > 2400) {
++    return;
++  }
++  if (t < 700 && (t / 90) % 2 == 0) {
++    fill(b, b.clip(), rgb(0xFFFFFF), 110);
++  }
++  int y = 52 + static_cast<int>(3 * sinf(t * 0.01f));
++  outlinedText(b, "GLOUTON \xC3\x89VOLUE !", k_screenWidth / 2, y, hsv(t / 3, 200, 255),
++               Large, Align::Center);
++  outlinedText(b, k_stageNames[s.stage], k_screenWidth / 2, y + 22, rgb(0xFFFFFF),
++               Small, Align::Center);
++}
++
++void renderDigest(Band& b) {
++  renderWorld(b);
++  uint32_t t = s.now - s.modeStart;
++  float k = t / 700.f;
++  k = k > 1 ? 1 : k;
++  float r = 420 * (1 - k) * (1 - k);
++  float mx, my;
++  mouth(&mx, &my);
++  iris(b, mx - camX(), my - camY(), r);
++  if (k > 0.6f && s.eatIndex >= 0 && s.eatIndex < s_numberOfItems) {
++    text(b, "Digestion de", k_screenWidth / 2, 104, rgb(0x8A8A9A), Small, Align::Center);
++    text(b, itemName(s.eatIndex), k_screenWidth / 2, 120, rgb(0xFFFFFF), Large,
++         Align::Center);
++  }
++}
++
++void digest() {
++  /* GLOUTON swallowed an app: the screen closes on its mouth, then the app
++   * opens (inside its belly, obviously). Drawn here: the app is opened right
++   * after. */
++  s.mode = Mode::Digest;
++  s.modeStart = s.now;
++  Band band;
++  while (!s_fake) {
++    s.now = clockMs();
++    if (s.now - s.modeStart > 900) {
++      break;
++    }
++    updateLed();
++    for (int y = 0; y < k_screenHeight; y += Band::k_maxHeight) {
++      Rect area = {0, y, k_screenWidth, Band::k_maxHeight};
++      band.begin(area);
++      Shell::render(band);
++      Ion::Display::pushRect(KDRect(area.x, area.y, area.w, area.h), band.pixels());
++    }
++  }
++  s.mode = Mode::World;
++  s.launches++;
++  s.lastLaunched = s.eatIndex;
++  s.detachTime = s.now;
++  s_launch = s_items[s.eatIndex].item;
++}
++
++/* ========================================================= photo session */
++
++#if !PLATFORM_DEVICE
++const char* s_shotDir = nullptr;
++KDColor s_shot[k_screenWidth * k_screenHeight];
++int s_gifFrame = 0;
++
++void shoot(const char* name) {
++  Band band;
++  for (int y = 0; y < k_screenHeight; y += Band::k_maxHeight) {
++    Rect area = {0, y, k_screenWidth, Band::k_maxHeight};
++    band.begin(area);
++    Shell::render(band);
++    memcpy(s_shot + y * k_screenWidth, band.pixels(),
++           sizeof(KDColor) * k_screenWidth * Band::k_maxHeight);
++  }
++  char path[512];
++  snprintf(path, sizeof(path), "%s/%s.raw", s_shotDir, name);
++  FILE* f = fopen(path, "wb");
++  if (f) {
++    fwrite(s_shot, 2, k_screenWidth * k_screenHeight, f);
++    fclose(f);
++  }
++}
++
++void gifFrame(const char* prefix) {
++  char name[64];
++  snprintf(name, sizeof(name), "%s_%04d", prefix, s_gifFrame++);
++  shoot(name);
++}
++
++uint64_t keyBit(Key k) { return 1ull << static_cast<int>(k); }
++
++void step(int ms, const char* gif, int every = 1) {
++  int n = 0;
++  for (int t = 0; t < ms; t += 40) {
++    s_fakeClock += 40;
++    Shell::frame();
++    if (gif && (n++ % every) == 0) {
++      gifFrame(gif);
++    }
++  }
++}
++
++void hold(uint64_t keys, int ms, const char* gif, int every = 1) {
++  s_fakeKeys = keys;
++  step(ms, gif, every);
++  s_fakeKeys = 0;
++}
++
++void press(Event e, int ms, const char* gif = nullptr, int every = 1) {
++  Shell::handleEvent(e);
++  step(ms, gif, every);
++}
++
++void quiet() {
++  s.message.text[0] = 0;
++  s.queueLength = 0;
++  for (Particle& p : s.particles) {
++    p.life = 0;
++  }
++  s.partyUntil = s.danceUntil = s.evilUntil = s.sickUntil = s.angryUntil = 0;
++  s.faceUntil = s.flashUntil = s.shakeUntil = s.hugeUntil = 0;
++  s.evolveStart = 0;
++  s.sleeping = false;
++  for (Pellet& p : s.pellets) {
++    p.active = false;
++  }
++}
++
++void placeBlob(float x) {
++  s.blob.moveTo(x, k_floorY - s.blob.radius());
++  s.camX = s.camTarget = x - k_screenWidth / 2;
++  if (s.camX < 0) {
++    s.camX = 0;
++  }
++}
++
++void photoSession() {
++  s_fake = true;
++  s_fakeClock = 100000;
++  s.now = s.last = s_fakeClock;
++  s.modeStart = s.now;
++  s.mode = Mode::Boot;
++  // The hatching, as a GIF
++  s_gifFrame = 0;
++  for (int t = 0; t < 7000; t += 80) {
++    step(80, nullptr);
++    gifFrame("gifboot");
++  }
++  s.mode = Mode::Boot;
++  s.modeStart = s_fakeClock - 2900;
++  step(40, nullptr);
++  shoot("boot_egg");
++  s.modeStart = s_fakeClock - 6200;
++  step(40, nullptr);
++  shoot("boot_title");
++  startWorld();
++  quiet();
++  s.xp = 6;
++  s.stage = 1;
++  s.blob.setRadius(k_stageRadius[1]);
++  s.blob.init(200, k_floorY - 30, k_stageRadius[1]);
++  s.hunger = 30;
++  s.lastInput = s_fakeClock;
++  // Walk, look, eat
++  step(800, nullptr);
++  s_gifFrame = 0;
++  hold(keyBit(Key::Right), 1300, "gifplay", 2);
++  press(Events::Up, 0);
++  hold(keyBit(Key::Up) | keyBit(Key::Right), 600, "gifplay", 2);
++  step(500, "gifplay", 2);
++  Food::push("6\xC3\x97" "7", "42");
++  collectFood();
++  step(900, "gifplay", 2);
++  hold(keyBit(Key::Left), 300, "gifplay", 2);
++  step(1800, "gifplay", 2);
++  press(Events::Square, 150, "gifplay", 2);
++  press(Events::Square, 150, "gifplay", 2);
++  press(Events::Square, 150, "gifplay", 2);
++  press(Events::Square, 150, "gifplay", 2);
++  press(Events::Square, 150, "gifplay", 2);
++  step(2400, "gifplay", 2);
++  // Stills
++  quiet();
++  placeBlob(300);
++  step(1200, nullptr);
++  s.facing = 1;
++  step(200, nullptr);
++  shoot("monde_jardin");
++  // Tongue
++  quiet();
++  placeBlob(380);
++  s.facing = 1;
++  step(800, nullptr);
++  Shell::handleEvent(Events::OK);
++  step(120, nullptr);
++  shoot("langue");
++  step(260, nullptr);
++  shoot("miam");
++  s.eat = EatPhase::None;
++  s.goneItem = -1;
++  // A calculation rains down
++  quiet();
++  placeBlob(240);
++  Food::push("2^10", "1024");
++  collectFood();
++  step(700, nullptr);
++  shoot("pluie_resultat");
++  step(1600, nullptr);
++  quiet();
++  Food::push("6\xC3\x97" "111", "666");
++  collectFood();
++  step(1500, nullptr);
++  s.messageStart = s.now - 500;
++  shoot("666");
++  quiet();
++  Food::push("0/0", "undef");
++  collectFood();
++  step(1500, nullptr);
++  s.messageStart = s.now - 500;
++  shoot("undef");
++  quiet();
++  Food::push("1+1", "2");
++  collectFood();
++  step(1500, nullptr);
++  s.messageStart = s.now - 500;
++  shoot("un_plus_un");
++  // Biomes
++  static constexpr const char* k_names[] = {"decor_jardin", "decor_nuit", "decor_volcan",
++                                            "decor_espace", "decor_aquarium",
++                                            "decor_disco"};
++  for (int i = 0; i < k_numberOfBiomes; i++) {
++    quiet();
++    setBiome(static_cast<Biome>(i), false);
++    placeBlob(220 + i * 60);
++    for (int k = 0; k < 60; k++) {
++      ambient(0.05f);
++      updateParticles(0.05f);
++    }
++    step(600, nullptr);
++    say(k_biomes[i].line, Face::Joy, 9000);
++    s.messageStart = s.now - 500;
++    shoot(k_names[i]);
++  }
++  setBiome(Biome::Garden, false);
++  // Clones and costumes
++  quiet();
++  placeBlob(260);
++  for (int i = 0; i < 5; i++) {
++    Shell::handleEvent(Events::Multiplication);
++    step(80, nullptr);
++  }
++  Shell::handleEvent(Events::Cosine);
++  step(1500, nullptr);
++  shoot("clones");
++  // Pop
++  quiet();
++  s.numberOfMinis = 0;
++  s.costume = 0;
++  placeBlob(330);
++  for (int i = 0; i < 4; i++) {
++    Shell::handleEvent(Events::Square);
++    step(300, nullptr);
++  }
++  shoot("gonfle");
++  Shell::handleEvent(Events::Square);
++  Shell::handleEvent(Events::Square);
++  step(240, nullptr);
++  shoot("pop");
++  step(2000, nullptr);
++  // Gravity, ghost
++  quiet();
++  Shell::handleEvent(Events::Minus);
++  step(1600, nullptr);
++  s.messageStart = s.now - 500;
++  shoot("gravite_negative");
++  Shell::handleEvent(Events::Minus);
++  step(1200, nullptr);
++  quiet();
++  setBiome(Biome::Night, false);
++  Shell::handleEvent(Events::Imaginary);
++  step(1200, nullptr);
++  s.messageStart = s.now - 500;
++  shoot("imaginaire");
++  Shell::handleEvent(Events::Imaginary);
++  step(1500, nullptr);
++  setBiome(Biome::Garden, false);
++  // Sleeping
++  quiet();
++  placeBlob(200);
++  step(600, nullptr);
++  s.sleeping = true;
++  step(2500, nullptr);
++  shoot("dodo");
++  s.sleeping = false;
++  // Starving: it eats the screen
++  quiet();
++  s.hunger = 100;
++  s.nextBite = 0;
++  for (int i = 0; i < 4; i++) {
++    s.nextBite = 0;
++    step(80, nullptr);
++  }
++  s.messageStart = s.now - 500;
++  shoot("affame");
++  s.numberOfBites = 0;
++  s.hunger = 20;
++  // Evolution
++  quiet();
++  s.xp = 13;
++  gainXp(1);
++  step(500, nullptr);
++  shoot("evolution");
++  step(2500, nullptr);
++  // Fridge, notebook
++  quiet();
++  Shell::handleEvent(Events::Back);
++  step(400, nullptr);
++  Shell::handleEvent(Events::Right);
++  Shell::handleEvent(Events::Down);
++  step(100, nullptr);
++  shoot("frigo");
++  Shell::handleEvent(Events::Back);
++  s.numbersEaten = 23;
++  s.appsEaten = 9;
++  s.weight = 3140;
++  Shell::handleEvent(Events::Toolbox);
++  step(100, nullptr);
++  shoot("carnet");
++  Shell::handleEvent(Events::Right);
++  step(100, nullptr);
++  shoot("touches");
++  Shell::handleEvent(Events::Back);
++  // Digest
++  quiet();
++  placeBlob(240);
++  s.eatIndex = 9 < s_numberOfItems ? 9 : 0;
++  s.mode = Mode::Digest;
++  s.modeStart = s.now - 600;
++  shoot("digestion");
++  s.mode = Mode::World;
++  printf("GLOUTON photo session done: %d items\n", s_numberOfItems);
++}
++#endif
++
++}  // namespace
++
++/* =============================================================== shell */
++
++namespace Shell {
++
++void attach() {
++  s_attached = true;
++  s_launch = k_noItem;
++  s.now = s.last = clockMs();
++  buildWorld();
++  s.userBrightness = GlobalPreferences::SharedGlobalPreferences()->brightnessLevel();
++  s.brightness = s.userBrightness;
++  bool first = !s.initialized;
++  if (first) {
++    s.initialized = true;
++    s.random = 0x9E3779B9u ^ Ion::random();
++    if (s.random == 0) {
++      s.random = 1;
++    }
++    s.biome = Biome::Night;
++    s.hud = true;
++    s.ledOn = s.lightOn = true;
++    s.facing = 1;
++    s.hunger = 55;
++    s.weight = 120;
++    s.inflation = 1.f;
++    s.goneItem = s.lastLaunched = -1;
++    s.birth = s.now;
++    s.camX = 0;
++    s.blob.init(160, k_floorY - 20, k_stageRadius[0]);
++    s.mode = Mode::Boot;
++    s.modeStart = s.now;
++    s.lastInput = s.now;
++    s.foodSeen = Food::produced();
++  } else {
++    // Back from an app: GLOUTON spits you out
++    s.mode = Mode::World;
++    s.modeStart = s.now;
++    s.lastInput = s.now;
++    s.irisStart = s.now;
++    s.message.text[0] = 0;
++    s.queueLength = 0;
++    s.eat = EatPhase::None;
++    s.sleeping = false;
++    if (s.goneItem >= 0) {
++      sparkles(s_items[s.goneItem].x, s_items[s.goneItem].y, 14, rgb(0xFFFFFF));
++    }
++    s.goneItem = -1;
++    if (s.launches > 0) {
++      s.blob.squeeze(-3.f);
++      s.blob.impulse(s.facing * 60.f, -120.f);
++      say(k_spit[rnd() % count(k_spit)], Face::Joy, 1200);
++      int last = s.lastLaunched;
++      if (last >= 0 && last < s_numberOfItems) {
++        if (isGame(last)) {
++          queue("Tu as jou\xC3\xA9 SANS MOI ?!", Face::Angry, 3000);
++        } else if (s_items[last].info) {
++          queue(s_items[last].info->back, Face::Happy, 3200);
++        }
++      }
++      uint32_t away = (s.now - s.detachTime) / 60000;
++      if (away >= 3) {
++        char line[80];
++        Str m(line, sizeof(line));
++        m.add("Tu m'as laiss\xC3\xA9 seul\n").addInt(away).add(" minutes. J'ai compt\xC3\xA9.");
++        queue(line, Face::Hungry, 3500);
++      }
++    }
++    int n = collectFood();
++    if (n > 0) {
++      queue(n > 1 ? "Des r\xC3\xA9sultats !!! Il en\npleut ! \xC3\x80 TABLE !"
++                  : "Oh ! Un r\xC3\xA9sultat tout\nfrais. MIAM.",
++            Face::Love, 3000);
++    }
++  }
++  frame();
++#if !PLATFORM_DEVICE
++  const char* shots = getenv("GLOUTON_SHOTS");
++  if (shots && first) {
++    s_shotDir = shots;
++    photoSession();
++    exit(0);
++  }
++#endif
++}
++
++void detach() {
++  s.detachTime = clockMs();
++  restoreLed();
++  if (s.brightness != s.userBrightness && !s_fake) {
++    Ion::Backlight::setBrightness(s.userBrightness);
++  }
++  s.brightness = s.userBrightness;
++  s_attached = false;
++}
++
++Item takeLaunch() {
++  Item it = s_launch;
++  s_launch = k_noItem;
++  return it;
++}
++
++int framePeriod() {
++  if (s.sleeping && s.mode == Mode::World) {
++    return 110;  // it sleeps: save the battery
++  }
++  if (s.mode == Mode::Notebook) {
++    return 120;
++  }
++  return 30;
++}
++
++bool handleEvent(Event e) {
++  if (!s_attached) {
++    return false;
++  }
++  if (!e.isKeyboardEvent() || e == Events::OnOff) {
++    return false;
++  }
++  if (e == Events::Shift || e == Events::Alpha || e == Events::AlphaCaps) {
++    return false;
++  }
++  s.now = clockMs();
++  s.lastInput = s.now;
++  Ion::Keyboard::State keys = scanKeys();
++  switch (s.mode) {
++    case Mode::Boot: {
++      uint32_t t = s.now - s.modeStart;
++      if (t < 3300) {
++        // Knocking on the egg makes it hatch sooner
++        s.modeStart -= 450;
++        shake(2, 150);
++      } else if (t > 4000) {
++        startWorld();
++      }
++      return true;
++    }
++    case Mode::Digest:
++      return true;
++    case Mode::Fridge: {
++      int perPage = k_fridgeColumns * k_fridgeRows;
++      int i = s.menuSelected;
++      if (e == Events::Left) {
++        i--;
++      } else if (e == Events::Right) {
++        i++;
++      } else if (e == Events::Up) {
++        i -= k_fridgeColumns;
++      } else if (e == Events::Down) {
++        i += k_fridgeColumns;
++      } else if (e == Events::OK || e == Events::EXE) {
++        eatFromFridge(s.menuSelected);
++        return true;
++      } else if (e == Events::Back || e == Events::Home) {
++        s.mode = Mode::World;
++        return true;
++      }
++      if (i < 0) {
++        i = 0;
++      }
++      if (i >= s_numberOfItems) {
++        i = s_numberOfItems - 1;
++      }
++      (void)perPage;
++      s.menuSelected = i;
++      return true;
++    }
++    case Mode::Notebook:
++      if (e == Events::Left || e == Events::Right) {
++        s.notebookPage = 1 - s.notebookPage;
++      } else if (e == Events::One) {
++        s.ledOn = !s.ledOn;
++      } else if (e == Events::Two) {
++        s.lightOn = !s.lightOn;
++      } else if (e == Events::Back || e == Events::Home || e == Events::Toolbox ||
++                 e == Events::OK) {
++        s.mode = Mode::World;
++      }
++      return true;
++    default:
++      break;
++  }
++  // World
++  if (s.sleeping) {
++    s.sleeping = false;
++    s.blob.impulse(0, -200);
++    shake(3, 300);
++    say("HEIN ?! Je dormais pas.", Face::Wow, 2200);
++    return true;
++  }
++  if (e == Events::Left || e == Events::Right) {
++    Key k = e == Events::Left ? Key::Left : Key::Right;
++    s.facing = e == Events::Left ? -1 : 1;
++    if (!keys.keyDown(k)) {
++      s.blob.impulse(s.facing * 90.f, 0);
++    }
++    return true;
++  }
++  if (e == Events::Up || e == Events::EXE) {
++    s.jumpRequest = true;
++    return true;
++  }
++  if (e == Events::Down) {
++    if (s.blob.grounded()) {
++      s.blob.squeeze(2.5f);
++    } else {
++      s.slamRequest = true;
++    }
++    return true;
++  }
++  if (e == Events::OK) {
++    tongue();
++    return true;
++  }
++  if (e == Events::Back || e == Events::Home) {
++    s.mode = Mode::Fridge;
++    s.modeStart = s.now;
++    if (s.menuSelected >= s_numberOfItems) {
++      s.menuSelected = 0;
++    }
++    return true;
++  }
++  if (e == Events::Toolbox) {
++    s.mode = Mode::Notebook;
++    s.notebookPage = 0;
++    return true;
++  }
++  if (e == Events::Var) {
++    s.hud = !s.hud;
++    return true;
++  }
++  if (e == Events::Ans) {
++    say(k_jokes[s.jokeIndex % count(k_jokes)], Face::Joy, 4500);
++    s.jokeIndex++;
++    return true;
++  }
++  if (e == Events::Pi) {
++    s.partyUntil = s.now + 5000;
++    confetti(s.blob.x(), s.blob.y() - 40, 50);
++    say("\xCF\x80 ! \xCF\x80 ! \xCF\x80 !\n3,14159265358979...", Face::Love, 3500);
++    return true;
++  }
++  if (e == Events::Square) {
++    if (s.popping) {
++      return true;
++    }
++    s.inflation += 0.2f;
++    s.hugeUntil = s.now + 2500;
++    s.blob.setInflation(s.inflation);
++    s.blob.jiggle(80, rnd());
++    if (s.inflation > 1.95f) {
++      s.hugeUntil = 0;
++      startPop();
++    } else if (s.inflation > 1.7f) {
++      say("STOP ! Je vais\nEXPLOSEEER !!!", Face::Wow, 1500);
++    } else if (s.inflation > 1.3f) {
++      say("x\xC2\xB2... je gonfle !", Face::Wow, 1500);
++    }
++    return true;
++  }
++  if (e == Events::Sqrt) {
++    s.inflation -= 0.2f;
++    if (s.inflation < 0.55f) {
++      s.inflation = 0.55f;
++      say("Plus petit, je peux pas.\nJe suis un bonsa\xC3\xAF.", Face::Dizzy, 2000);
++    } else {
++      say("\xE2\x88\x9A : je r\xC3\xA9tr\xC3\xA9""cis !", Face::Wow, 1200);
++    }
++    s.hugeUntil = s.now + 6000;
++    s.blob.setInflation(s.inflation);
++    return true;
++  }
++  if (e == Events::Multiplication) {
++    if (s.numberOfMinis < k_maxMinis) {
++      Mini& m = s.minis[s.numberOfMinis++];
++      m = {s.blob.x(), s.blob.y(), -s.facing * 120.f, -200.f, 0.4f, 0};
++      sparkles(s.blob.x(), s.blob.y(), 8, rgb(0xFFFFFF));
++      char line[40];
++      Str l(line, sizeof(line));
++      l.add("GLOUTON \xC3\x97").addInt(s.numberOfMinis + 1).add(" !");
++      say(line, Face::Joy, 1500);
++    } else {
++      say("Trop de clones. Ils vont\nmanger MA nourriture.", Face::Angry, 2500);
++    }
++    return true;
++  }
++  if (e == Events::Division) {
++    if (s.numberOfMinis > 0) {
++      for (int i = 0; i < s.numberOfMinis; i++) {
++        sparkles(s.minis[i].x, s.minis[i].y, 5, rgb(0xFFFFFF));
++      }
++      s.numberOfMinis = 0;
++      s.blob.jiggle(160, rnd());
++      say("\xC3\xB7 : on fusionne !\n*sluuurp*", Face::Joy, 1800);
++    } else {
++      say("Diviser par moi-m\xC3\xAAme ?\n\xC3\x87""a fait 1. Toujours moi.", Face::Happy,
++          2500);
++    }
++    return true;
++  }
++  if (e == Events::Sine) {
++    s.danceUntil = s.now + 5000;
++    say("sin(x) ! Danse\nsinuso\xC3\xAF""dale !", Face::Joy, 2000);
++    return true;
++  }
++  if (e == Events::Cosine) {
++    s.costume = (s.costume + 1) % k_numberOfCostumes;
++    sparkles(s.blob.x(), s.blob.top(), 10, rgb(0xFFF07A));
++    char line[60];
++    Str l(line, sizeof(line));
++    l.add("cos(tume) : ").add(k_costumeNames[s.costume]);
++    say(line, Face::Joy, 1500);
++    return true;
++  }
++  if (e == Events::Tangent) {
++    s.tanned = !s.tanned;
++    say(s.tanned ? "tan : bronzage MAX.\nJe suis en vacances."
++                 : "Fini les vacances.",
++        Face::Joy, 2000);
++    return true;
++  }
++  if (e == Events::Imaginary) {
++    s.ghost = !s.ghost;
++    say(s.ghost ? "Je suis imaginaire.\nTu me vois ? Non."
++                : "Je suis r\xC3\xA9""el \xC3\xA0 nouveau !",
++        Face::Wow, 2200);
++    return true;
++  }
++  if (e == Events::Minus) {
++    s.flipped = !s.flipped;
++    shake(3, 300);
++    say(s.flipped ? "GRAVIT\xC3\x89 N\xC3\x89GATIVE !\nJ'ai le vertiiige !"
++                  : "Ouf, le sol.", Face::Wow, 2000);
++    return true;
++  }
++  if (e == Events::Ln || e == Events::Log) {
++    s.sleeping = true;
++    say("ln : je dors comme\nune b\xC3\xBB""che. zZz", Face::Sleep, 2000);
++    return true;
++  }
++  if (e == Events::Backspace) {
++    if (s.now - s.lastPoke > 3000) {
++      s.pokes = 0;
++    }
++    s.lastPoke = s.now;
++    s.pokes++;
++    s.blob.jiggle(220, rnd());
++    if (s.pokes >= 6) {
++      s.pokes = 0;
++      s.angryUntil = s.now + 5000;
++      shake(5, 500);
++      for (int i = 0; i < 6; i++) {
++        spawn(PKind::Steam, s.blob.x() + (i % 2 ? 12 : -12), s.blob.top(),
++              (i % 2 ? 30 : -30), -40, 900, rgb(0xFFFFFF), 4);
++      }
++      say("ARR\xC3\x8ATE !!!\nJe suis chatouilleux !!", Face::Angry, 2500);
++    } else {
++      static constexpr const char* k_giggles[] = {"Hihihi !", "Hahaha !",
++                                                  "Arr\xC3\xAAte \xC3\xA7""a !",
++                                                  "HIHIHIHI"};
++      say(k_giggles[rnd() % count(k_giggles)], Face::Joy, 900);
++      spawn(PKind::Heart, s.blob.x(), s.blob.top(), 0, -40, 900, rgb(0xFF4F8B), 1);
++    }
++    return true;
++  }
++  if (e == Events::Plus) {
++    long v = 1 + rnd() % 99;
++    char out[8];
++    Str o(out, sizeof(out));
++    o.addInt(v);
++    spawnPellet("+", out, s.blob.x() + s.facing * 50);
++    say("Un en-cas !", Face::Love, 1000);
++    return true;
++  }
++  constexpr Event k_biomeKeys[] = {Events::One, Events::Two, Events::Three,
++                                   Events::Four, Events::Five, Events::Six};
++  for (int i = 0; i < k_numberOfBiomes; i++) {
++    if (e == k_biomeKeys[i]) {
++      if (i == static_cast<int>(Biome::Disco) && !s.discoUnlocked) {
++        say("Secret. Nourris-moi\nd'abord. Beaucoup.", Face::Happy, 2500);
++        return true;
++      }
++      if (static_cast<int>(s.biome) != i) {
++        setBiome(static_cast<Biome>(i), true);
++      }
++      return true;
++    }
++  }
++  return true;
++}
++
++bool frame() {
++  if (!s_attached) {
++    return false;
++  }
++  s.now = clockMs();
++  float dt = (s.now - s.last) / 1000.f;
++  if (dt > 0.05f) {
++    dt = 0.05f;
++  }
++  s.last = s.now;
++  updateMessages();
++  if (s.now < s.shakeUntil) {
++    int a = static_cast<int>(s.shakeAmp * (s.shakeUntil - s.now) / 300.f + 0.5f);
++    a = a > 8 ? 8 : a;
++    s_shakeX = a > 0 ? static_cast<int>(rnd() % (2 * a + 1)) - a : 0;
++    s_shakeY = a > 0 ? static_cast<int>(rnd() % (2 * a + 1)) - a : 0;
++  } else {
++    s_shakeX = s_shakeY = 0;
++  }
++  if (s.mode == Mode::Boot) {
++    updateBoot(dt);
++    if (s.now - s.modeStart > 7600) {
++      startWorld();
++    }
++  } else if (s.mode != Mode::Digest) {
++    hungerLife(dt);
++    if (s.mode == Mode::World) {
++      updateWorld(dt, scanKeys());
++    }
++    updateParticles(dt);
++  }
++  prepareBackground();
++  updateLed();
++  updateBacklight();
++  return true;
++}
++
++void render(Band& b) {
++  if (!s_attached) {
++    fill(b, b.area(), rgb(0x000000));
++    return;
++  }
++  switch (s.mode) {
++    case Mode::Boot:
++      renderBoot(b);
++      return;
++    case Mode::Digest:
++      renderDigest(b);
++      return;
++    case Mode::Fridge:
++      drawFridge(b);
++      return;
++    case Mode::Notebook:
++      drawNotebook(b);
++      return;
++    default:
++      break;
++  }
++  renderWorld(b);
++  if (s.evolveStart && s.now - s.evolveStart < 2400) {
++    drawEvolution(b);
++  }
++  // Coming back from an app: the mouth opens
++  uint32_t open = s.now - s.irisStart;
++  if (s.launches > 0 && open < 600) {
++    float k = open / 600.f;
++    float mx, my;
++    mouth(&mx, &my);
++    iris(b, mx - camX(), my - camY(), 420 * k * k);
++  }
++  if (!s.hud && s.mode == Mode::World) {
++    text(b, "MODE PHOTO  (var)", k_screenWidth - 6, k_screenHeight - 16,
++         rgb(0xFFFFFF), Small, Align::Right, k_screenWidth, 140);
++  }
++  drawBites(b);
++  if (s.now < s.flashUntil) {
++    fill(b, b.area(), rgb(0xFFFFFF), 160);
++  }
++}
++
++}  // namespace Shell
++
++}  // namespace Glouton
++}  // namespace Home
+diff --git a/epsilon/apps/home/glouton/shell.h b/epsilon/apps/home/glouton/shell.h
+new file mode 100644
+index 0000000000..a96aea1f8f
+--- /dev/null
++++ b/epsilon/apps/home/glouton/shell.h
+@@ -0,0 +1,39 @@
++#pragma once
++
++#include <ion/events.h>
++
++#include "gfx.h"
++
++namespace Home {
++namespace Glouton {
++
++// Something to start: a calculator app or an external app (.nwa game)
++struct Item {
++  enum class Kind : uint8_t { None, Builtin, External };
++  Kind kind;
++  int16_t index;  // app index in AppsContainer, or external app index
++  bool isNone() const { return kind == Kind::None; }
++};
++
++constexpr Item k_noItem = {Item::Kind::None, 0};
++
++/* The GLOUTON terrarium. Its state is static: the creature survives leaving
++ * the home app to run a calculator app or a game (it waits for you). */
++namespace Shell {
++
++void attach();
++void detach();
++// Returns true if the event was used
++bool handleEvent(Ion::Events::Event event);
++// One animation step. Returns true to redraw the screen.
++bool frame();
++// Animation period in ms
++int framePeriod();
++void render(Band& band);
++// The app to open, set by handleEvent; the caller opens it right away
++Item takeLaunch();
++
++}  // namespace Shell
++
++}  // namespace Glouton
++}  // namespace Home
+diff --git a/epsilon/escher/include/escher/app.h b/epsilon/escher/include/escher/app.h
+index 269ea7b590..8845dd2471 100644
+--- a/epsilon/escher/include/escher/app.h
++++ b/epsilon/escher/include/escher/app.h
+@@ -89,6 +89,9 @@ class App : public Responder {
+   virtual bool canStoreLayout() const { return false; }
+   virtual void storeLayout(const Poincare::Layout& layout = {}) {}
+   virtual int numberOfTimers() { return 0; }
++  // PSP-OS animations, see RunLoop. Return true to redraw the window.
++  virtual int animationPeriod() { return 0; }
++  virtual bool animationFrame() { return false; }
+   virtual Timer* timerAtIndex(int i) {
+     assert(false);
+     return nullptr;
+diff --git a/epsilon/escher/include/escher/container.h b/epsilon/escher/include/escher/container.h
+index 2a0cd8ce22..b7f005903d 100644
+--- a/epsilon/escher/include/escher/container.h
++++ b/epsilon/escher/include/escher/container.h
+@@ -37,6 +37,8 @@ class Container : public RunLoop {
+ 
+  private:
+   int numberOfTimers() override;
++  int animationPeriod() override;
++  void animationFrame() override;
+   Timer* timerAtIndex(int i) override;
+   virtual int numberOfContainerTimers();
+   virtual Timer* containerTimerAtIndex(int i);
+diff --git a/epsilon/escher/include/escher/run_loop.h b/epsilon/escher/include/escher/run_loop.h
+index 3c028526fe..40e32ba36b 100644
+--- a/epsilon/escher/include/escher/run_loop.h
++++ b/epsilon/escher/include/escher/run_loop.h
+@@ -16,6 +16,10 @@ class RunLoop {
+   virtual int numberOfTimers();
+   virtual Timer* timerAtIndex(int i);
+   virtual void listenToExternalEvents() = 0;
++  /* PSP-OS animations: when animationPeriod() > 0 (in ms), events are waited
++   * for at most that long and animationFrame() is called on every step. */
++  virtual int animationPeriod() { return 0; }
++  virtual void animationFrame() {}
+ 
+  private:
+   // Returns true while the Termination event is not fired.
+diff --git a/epsilon/escher/include/escher/theme/light_theme.h b/epsilon/escher/include/escher/theme/light_theme.h
+index 4d5f8cf5ec..e4246c442b 100644
+--- a/epsilon/escher/include/escher/theme/light_theme.h
++++ b/epsilon/escher/include/escher/theme/light_theme.h
+@@ -27,7 +27,7 @@ constexpr static ThemeContainer k_lightTheme =
+                    .InactiveTabSelected = Palette::SelectDark,
+                    .SurfaceSelect = Palette::Select,
+                    .SurfaceSelectApps = Palette::YellowDark,
+-                   .TitleBar = Palette::YellowDark,
++                   .TitleBar = KDSpecialColors::k_lightThemeMain,
+                    .BannerPurple = Palette::PurpleBright,
+                    .BannerElements = Palette::GrayWhite,
+                    .BannerGrayMiddle = Palette::GrayMiddle,
+@@ -60,7 +60,7 @@ constexpr static ThemeContainer k_lightTheme =
+                    .BorderPurple = Palette::PurpleBright,
+                    .BorderBoxTitleCell = Palette::PurpleDark,
+                    .BorderElementsBanner = Palette::GrayMiddle,
+-                   .SeparatorTitleBar = Palette::YellowDark,
++                   .SeparatorTitleBar = KDSpecialColors::k_lightThemeMain,
+                    .SeparatorTitleHeaders = Palette::Black,
+                    .ButtonLightBorderMain = Palette::GrayBright,
+                    .ButtonLightBorderBottom = Palette::GrayWhite,
+diff --git a/epsilon/escher/src/container.cpp b/epsilon/escher/src/container.cpp
+index a368cec4cc..0a9757b6de 100644
+--- a/epsilon/escher/src/container.cpp
++++ b/epsilon/escher/src/container.cpp
+@@ -44,6 +44,16 @@ bool Container::dispatchEvent(Ion::Events::Event event) {
+   return false;
+ }
+ 
++int Container::animationPeriod() {
++  return s_activeApp ? s_activeApp->animationPeriod() : 0;
++}
++
++void Container::animationFrame() {
++  if (s_activeApp && s_activeApp->animationFrame()) {
++    window()->redraw();
++  }
++}
++
+ void Container::run() {
+   window()->redraw();
+   RunLoop::run();
+diff --git a/epsilon/escher/src/run_loop.cpp b/epsilon/escher/src/run_loop.cpp
+index c20471d407..0b335f97e1 100644
+--- a/epsilon/escher/src/run_loop.cpp
++++ b/epsilon/escher/src/run_loop.cpp
+@@ -36,6 +36,10 @@ bool RunLoop::step() {
+ 
+   // Fetch the event, if any
+   int eventDuration = Timer::TickDuration;
++  int animation = animationPeriod();
++  if (animation > 0 && animation < eventDuration) {
++    eventDuration = animation;
++  }
+   int timeout = eventDuration;
+ 
+   Ion::Events::Event event = Ion::Events::getEvent(&timeout);
+@@ -85,6 +89,10 @@ bool RunLoop::step() {
+     dispatchEvent(event);
+   }
+ 
++  if (animation > 0 && event != Ion::Events::Termination) {
++    animationFrame();
++  }
++
+   return event != Ion::Events::Termination;
+ }
+ 
+diff --git a/shared/kandinsky/include/kandinsky/color.h b/shared/kandinsky/include/kandinsky/color.h
+index aa6dcf3fa1..489f6c280d 100644
+--- a/shared/kandinsky/include/kandinsky/color.h
++++ b/shared/kandinsky/include/kandinsky/color.h
+@@ -82,7 +82,7 @@ constexpr KDColor KDWhite = KDColor::RGB24(0xFFFFFF);
+  * kernel. */
+ namespace KDSpecialColors {
+ // Theme (light / dark) signature colors (used for example in the title bar)
+-constexpr KDColor k_lightThemeMain = KDColor::RGB24(0xFFB734);
++constexpr KDColor k_lightThemeMain = KDColor::RGB24(0x14A85A);  // GLOUTON slime green
+ constexpr KDColor k_darkThemeMain = KDColor::RGB24(0xC3CAF4);
+ // Theme (light / dark) neutral colors (black or white)
+ constexpr KDColor k_lightThemeNeutral = KDWhite;
